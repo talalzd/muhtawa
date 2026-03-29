@@ -64,3 +64,12 @@ export async function getAssessments(userId) {
     .order('created_at', { ascending: false })
   return { data: data || [], error }
 }
+
+// ── Feedback ──────────────────────────────────────────────────────
+
+export async function submitFeedback(userId, email, message, page) {
+  if (!supabase) return { error: null }
+  return await supabase
+    .from('feedback')
+    .insert({ user_id: userId, email, message, page })
+}
