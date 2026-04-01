@@ -594,7 +594,7 @@ function RegulationsAdmin({ user, mobile }) {
     })()
   }, [])
 
-  // Upload and parse PDF
+  // Upload and parse PDF — client-side using PDF.js (no server needed)
   const handlePdfUpload = async (e) => {
     const file = e.target.files?.[0]
     if (!file || !file.name.endsWith('.pdf')) { showToast('Please select a PDF file'); return }
@@ -602,36 +602,52 @@ function RegulationsAdmin({ user, mobile }) {
 
     setParsing(true)
     try {
-      const base64 = await new Promise((resolve, reject) => {
+      // Load PDF.js from CDN if not already loaded
+      if (!window.pdfjsLib) {
+        await new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
+          script.onload = resolve
+          script.onerror = reject
+          document.head.appendChild(script)
+        })
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+      }
+
+      // Read file as ArrayBuffer
+      const arrayBuffer = await new Promise((resolve, reject) => {
         const reader = new FileReader()
-        reader.onload = () => resolve(reader.result.split(',')[1])
+        reader.onload = () => resolve(reader.result)
         reader.onerror = reject
-        reader.readAsDataURL(file)
+        reader.readAsArrayBuffer(file)
       })
 
-      const headers = await getAuthHeader()
-      const res = await fetch('/api/parse-pdf', {
-        method: 'POST',
-        headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pdfBase64: base64, fileName: file.name }),
-      })
+      // Parse PDF
+      const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise
+      let fullText = ''
 
-      if (!res.ok) {
-        const err = await res.json()
-        showToast(err.error || 'Failed to parse PDF')
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i)
+        const textContent = await page.getTextContent()
+        const pageText = textContent.items.map(item => item.str).join(' ')
+        fullText += pageText + '\n\n'
+      }
+
+      if (!fullText.trim()) {
+        showToast('No text found in PDF. It may be a scanned image — try copy-pasting the text manually.')
         setParsing(false)
         return
       }
 
-      const data = await res.json()
-      setPdfText(data.text)
-      s('content', data.text)
+      setPdfText(fullText.trim())
+      s('content', fullText.trim())
       s('document_name', file.name.replace('.pdf', ''))
-      showToast(`Extracted ${data.pages} pages from ${file.name}`)
-    } catch {
-      showToast('Failed to parse PDF')
+      showToast(`Extracted ${pdf.numPages} pages from ${file.name}`)
+    } catch (err) {
+      showToast('Failed to parse PDF. Try copy-pasting the text instead.')
     }
     setParsing(false)
+    if (fileRef.current) fileRef.current.value = '' // reset file input
   }
 
   // Save regulation
