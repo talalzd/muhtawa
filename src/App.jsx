@@ -15,6 +15,15 @@ const inputStyle = { width: '100%', padding: '11px 14px', background: T.bgInput,
 const labelStyle = { display: 'block', fontSize: 12, fontWeight: 600, color: T.muted, marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.03em' }
 const btnP = { padding: '12px 28px', background: `linear-gradient(135deg, ${T.accent}, ${T.accentDim})`, border: 'none', borderRadius: 8, color: '#fff', fontWeight: 700, fontSize: 14, cursor: 'pointer' }
 
+// Admin check — set your email in Vercel env var ADMIN_EMAILS
+const ADMIN_EMAIL_LIST = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase())
+function isAdminUser(email) {
+  if (!email) return false
+  // Fallback: if env var not set, check common admin patterns
+  if (ADMIN_EMAIL_LIST.length > 0 && ADMIN_EMAIL_LIST[0] !== '') return ADMIN_EMAIL_LIST.includes(email.toLowerCase())
+  return false
+}
+
 // ─── #10: SANITIZE ERROR MESSAGES ──────────────────────────────────────
 function sanitizeError(msg) {
   if (!msg) return 'Something went wrong. Please try again.'
@@ -172,6 +181,7 @@ export default function App() {
         {view === 'calculator' && <Calculator assessment={curA || emptyAssessment()} onSave={handleSaveAssessment} company={company} onExport={handleExport} mobile={mobile} />}
         {view === 'made-in-saudi' && <MadeInSaudi mobile={mobile} />}
         {view === 'advisor' && <Advisor company={company} currentAssessment={curA} mobile={mobile} />}
+        {view === 'admin' && isAdminUser(user?.email) && <RegulationsAdmin user={user} mobile={mobile} />}
         {/* #14: Feedback mechanism */}
         <Feedback user={user} currentView={view} />
       </main>
@@ -290,7 +300,7 @@ function Auth({ onAuth, onBack }) {
 
 // ═══ SIDEBAR (#13: mobile overlay) ═══
 function Sidebar({ view, setView, user, open, toggle, onLogout, mobile }) {
-  const items = [{ id: 'dashboard', icon: '◻', label: 'Dashboard' }, { id: 'calculator', icon: '⊞', label: 'LC Calculator' }, { id: 'made-in-saudi', icon: '⬡', label: 'Made in Saudi' }, { id: 'advisor', icon: '◎', label: 'AI Advisor' }]
+  const items = [{ id: 'dashboard', icon: '◻', label: 'Dashboard' }, { id: 'calculator', icon: '⊞', label: 'LC Calculator' }, { id: 'made-in-saudi', icon: '⬡', label: 'Made in Saudi' }, { id: 'advisor', icon: '◎', label: 'AI Advisor' }, { id: 'admin', icon: '⛭', label: 'Regulations', admin: true }]
   const name = user?.user_metadata?.name || user?.email?.split('@')[0] || 'User'
   const nav = id => { setView(id); if (mobile) toggle() }
   return (
@@ -300,7 +310,7 @@ function Sidebar({ view, setView, user, open, toggle, onLogout, mobile }) {
         {(open || mobile) && <span style={{ fontSize: 18, fontWeight: 700, whiteSpace: 'nowrap', color: T.text }}>Muhtawa</span>}
       </div>
       <nav style={{ flex: 1, padding: '16px 8px' }}>
-        {items.map(it => (
+        {items.filter(it => !it.admin || isAdminUser(user?.email)).map(it => (
           <div key={it.id} onClick={() => nav(it.id)} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', marginBottom: 4, borderRadius: 8, cursor: 'pointer', background: view === it.id ? T.glow : 'transparent', color: view === it.id ? T.accent : T.muted, transition: 'all 0.2s' }}
             onMouseEnter={e => { if (view !== it.id) e.currentTarget.style.background = T.bgHover }} onMouseLeave={e => { if (view !== it.id) e.currentTarget.style.background = 'transparent' }}>
             <span style={{ fontSize: 18, flexShrink: 0, width: 24, textAlign: 'center' }}>{it.icon}</span>
@@ -541,6 +551,292 @@ function Advisor({ company, currentAssessment, mobile }) {
         <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === 'Enter' && send()} placeholder="Ask about compliance..." style={{ flex: 1, padding: '10px 14px', background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 10, color: T.text, fontSize: 14, outline: 'none' }} />
         <button onClick={send} disabled={busy || !input.trim()} style={{ ...btnP, padding: '10px 20px', opacity: input.trim() ? 1 : 0.4 }}>Send</button>
       </div>
+    </div>
+  )
+}
+
+// ═══ REGULATIONS ADMIN ═══
+const REG_CATEGORIES = ['Eligibility', 'Scoring Methodology', 'Submission Process', 'Thresholds', 'Exemptions', 'Penalties', 'Made in Saudi', 'Procurement Rules', 'General', 'Other']
+
+function RegulationsAdmin({ user, mobile }) {
+  const [regs, setRegs] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [mode, setMode] = useState('list') // list, add, edit
+  const [editReg, setEditReg] = useState(null)
+  const [pdfText, setPdfText] = useState('')
+  const [parsing, setParsing] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [toast, setToast] = useState('')
+  const [form, setForm] = useState({ source: 'LCGPA', title: '', category: 'General', subcategory: '', document_name: '', article_numbers: '', content: '', summary: '', effective_date: '' })
+  const fileRef = useRef(null)
+
+  const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(''), 3000) }
+  const s = (k, v) => setForm(p => ({ ...p, [k]: v }))
+
+  const getAuthHeader = async () => {
+    if (!supabase) return {}
+    const { data: { session } } = await supabase.auth.getSession()
+    return session ? { Authorization: `Bearer ${session.access_token}` } : {}
+  }
+
+  // Load regulations
+  useEffect(() => {
+    (async () => {
+      try {
+        const headers = await getAuthHeader()
+        const res = await fetch('/api/regulations', { headers })
+        if (res.ok) {
+          const data = await res.json()
+          setRegs(data.regulations || [])
+        }
+      } catch {}
+      setLoading(false)
+    })()
+  }, [])
+
+  // Upload and parse PDF
+  const handlePdfUpload = async (e) => {
+    const file = e.target.files?.[0]
+    if (!file || !file.name.endsWith('.pdf')) { showToast('Please select a PDF file'); return }
+    if (file.size > 10 * 1024 * 1024) { showToast('File too large (max 10MB)'); return }
+
+    setParsing(true)
+    try {
+      const base64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(reader.result.split(',')[1])
+        reader.onerror = reject
+        reader.readAsDataURL(file)
+      })
+
+      const headers = await getAuthHeader()
+      const res = await fetch('/api/parse-pdf', {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pdfBase64: base64, fileName: file.name }),
+      })
+
+      if (!res.ok) {
+        const err = await res.json()
+        showToast(err.error || 'Failed to parse PDF')
+        setParsing(false)
+        return
+      }
+
+      const data = await res.json()
+      setPdfText(data.text)
+      s('content', data.text)
+      s('document_name', file.name.replace('.pdf', ''))
+      showToast(`Extracted ${data.pages} pages from ${file.name}`)
+    } catch {
+      showToast('Failed to parse PDF')
+    }
+    setParsing(false)
+  }
+
+  // Save regulation
+  const handleSave = async () => {
+    if (!form.title || !form.content || !form.category) { showToast('Title, category, and content are required'); return }
+    setSaving(true)
+    try {
+      const headers = await getAuthHeader()
+      const method = editReg ? 'PUT' : 'POST'
+      const body = editReg ? { id: editReg.id, ...form } : form
+
+      const res = await fetch('/api/regulations', {
+        method,
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+
+      if (res.ok) {
+        const data = await res.json()
+        if (editReg) {
+          setRegs(prev => prev.map(r => r.id === editReg.id ? data.regulation : r))
+        } else {
+          setRegs(prev => [...prev, data.regulation])
+        }
+        showToast(editReg ? 'Regulation updated' : 'Regulation saved')
+        resetForm()
+      } else {
+        const err = await res.json()
+        showToast(err.error || 'Failed to save')
+      }
+    } catch { showToast('Failed to save') }
+    setSaving(false)
+  }
+
+  // Delete regulation
+  const handleDelete = async (id) => {
+    if (!confirm('Remove this regulation?')) return
+    try {
+      const headers = await getAuthHeader()
+      await fetch('/api/regulations', {
+        method: 'DELETE',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      })
+      setRegs(prev => prev.filter(r => r.id !== id))
+      showToast('Regulation removed')
+    } catch { showToast('Failed to delete') }
+  }
+
+  const resetForm = () => {
+    setForm({ source: 'LCGPA', title: '', category: 'General', subcategory: '', document_name: '', article_numbers: '', content: '', summary: '', effective_date: '' })
+    setPdfText('')
+    setEditReg(null)
+    setMode('list')
+  }
+
+  const startEdit = (reg) => {
+    setForm({
+      source: reg.source, title: reg.title, category: reg.category,
+      subcategory: reg.subcategory || '', document_name: reg.document_name || '',
+      article_numbers: reg.article_numbers || '', content: reg.content,
+      summary: reg.summary || '', effective_date: reg.effective_date || '',
+    })
+    setEditReg(reg)
+    setMode('edit')
+  }
+
+  if (loading) return <div style={{ padding: 40, textAlign: 'center', color: T.muted }}>Loading regulations...</div>
+
+  return (
+    <div className="fade-in">
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 24, flexWrap: 'wrap', gap: 12 }}>
+        <div>
+          <h1 style={{ fontSize: mobile ? 22 : 28, fontWeight: 800, letterSpacing: '-0.02em', color: T.text, marginBottom: 4 }}>Regulations Knowledge Base</h1>
+          <p style={{ fontSize: 13, color: T.muted }}>{regs.length} regulations loaded. Upload LCGPA/EXPRO PDFs to power the AI advisor.</p>
+        </div>
+        {mode === 'list' && <button onClick={() => setMode('add')} style={{ ...btnP, padding: '10px 20px', fontSize: 13 }}>+ Add Regulation</button>}
+      </div>
+
+      {toast && <div className="fade-in" style={{ padding: '10px 16px', background: T.glow, border: '1px solid rgba(16,185,129,0.3)', borderRadius: 8, color: T.accent, fontSize: 13, marginBottom: 16 }}>{toast}</div>}
+
+      {/* ADD / EDIT FORM */}
+      {(mode === 'add' || mode === 'edit') && (
+        <div style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 16, padding: mobile ? 16 : 28, marginBottom: 24 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+            <h3 style={{ fontSize: 17, fontWeight: 700, color: T.text }}>{editReg ? 'Edit Regulation' : 'Add New Regulation'}</h3>
+            <button onClick={resetForm} style={{ background: 'none', border: 'none', color: T.muted, cursor: 'pointer', fontSize: 14 }}>← Back to list</button>
+          </div>
+
+          {/* PDF Upload */}
+          <div style={{ padding: 20, border: `2px dashed ${T.border}`, borderRadius: 12, textAlign: 'center', marginBottom: 20, background: T.bgInput, cursor: 'pointer' }} onClick={() => fileRef.current?.click()}>
+            <input ref={fileRef} type="file" accept=".pdf" onChange={handlePdfUpload} style={{ display: 'none' }} />
+            {parsing ? (
+              <div style={{ color: T.accent, fontSize: 14 }}>Extracting text from PDF...</div>
+            ) : (
+              <>
+                <div style={{ fontSize: 32, marginBottom: 8 }}>📄</div>
+                <div style={{ fontSize: 14, fontWeight: 600, color: T.text, marginBottom: 4 }}>Click to upload a PDF</div>
+                <div style={{ fontSize: 12, color: T.muted }}>The text will be extracted automatically. Max 10MB.</div>
+              </>
+            )}
+          </div>
+
+          {/* Form fields */}
+          <div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 16, marginBottom: 16 }}>
+            <div>
+              <label style={labelStyle}>Source</label>
+              <select value={form.source} onChange={e => s('source', e.target.value)} style={{ ...inputStyle, cursor: 'pointer' }}>
+                <option value="LCGPA">LCGPA</option>
+                <option value="EXPRO">EXPRO</option>
+              </select>
+            </div>
+            <div>
+              <label style={labelStyle}>Category</label>
+              <select value={form.category} onChange={e => s('category', e.target.value)} style={{ ...inputStyle, cursor: 'pointer' }}>
+                {REG_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={labelStyle}>Title</label>
+              <input value={form.title} onChange={e => s('title', e.target.value)} placeholder="e.g., Executive Regulations — Eligibility Criteria" style={inputStyle} />
+            </div>
+            <div>
+              <label style={labelStyle}>Document Name</label>
+              <input value={form.document_name} onChange={e => s('document_name', e.target.value)} placeholder="e.g., LCGPA Executive Regulations 2024" style={inputStyle} />
+            </div>
+            <div>
+              <label style={labelStyle}>Article Numbers</label>
+              <input value={form.article_numbers} onChange={e => s('article_numbers', e.target.value)} placeholder="e.g., Articles 11-15" style={inputStyle} />
+            </div>
+            <div>
+              <label style={labelStyle}>Effective Date</label>
+              <input type="date" value={form.effective_date} onChange={e => s('effective_date', e.target.value)} style={inputStyle} />
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 16 }}>
+            <label style={labelStyle}>Summary (brief description for search matching)</label>
+            <textarea value={form.summary} onChange={e => s('summary', e.target.value)} rows={2} placeholder="One-line summary of what this regulation covers..." style={{ ...inputStyle, resize: 'vertical' }} />
+          </div>
+
+          <div style={{ marginBottom: 20 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 5 }}>
+              <label style={{ ...labelStyle, marginBottom: 0 }}>Content</label>
+              <span style={{ fontSize: 11, color: T.dim }}>{form.content.length.toLocaleString()} chars</span>
+            </div>
+            <textarea value={form.content} onChange={e => s('content', e.target.value)} rows={12} placeholder="Paste or upload regulation text here..." style={{ ...inputStyle, resize: 'vertical', fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, lineHeight: 1.6 }} />
+          </div>
+
+          <div style={{ display: 'flex', gap: 12 }}>
+            <button onClick={handleSave} disabled={saving} style={{ ...btnP, opacity: saving ? 0.7 : 1 }}>
+              {saving ? 'Saving...' : editReg ? 'Update Regulation' : 'Save Regulation'}
+            </button>
+            <button onClick={resetForm} style={{ padding: '12px 24px', background: 'transparent', border: `1px solid ${T.border}`, borderRadius: 8, color: T.muted, fontSize: 14, cursor: 'pointer' }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* REGULATIONS LIST */}
+      {mode === 'list' && (
+        <div>
+          {regs.length === 0 ? (
+            <div style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 16, padding: 48, textAlign: 'center' }}>
+              <div style={{ fontSize: 48, marginBottom: 16 }}>📂</div>
+              <p style={{ fontSize: 16, fontWeight: 600, color: T.text, marginBottom: 8 }}>No regulations uploaded yet</p>
+              <p style={{ fontSize: 13, color: T.muted, marginBottom: 20 }}>Upload LCGPA and EXPRO PDFs to give the AI Advisor authoritative knowledge.</p>
+              <button onClick={() => setMode('add')} style={{ ...btnP, padding: '10px 24px', fontSize: 13 }}>Upload First Regulation</button>
+            </div>
+          ) : (
+            <>
+              {['LCGPA', 'EXPRO'].map(source => {
+                const sourceRegs = regs.filter(r => r.source === source)
+                if (sourceRegs.length === 0) return null
+                return (
+                  <div key={source} style={{ marginBottom: 24 }}>
+                    <h3 style={{ fontSize: 15, fontWeight: 700, color: T.accent, marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{source} — {sourceRegs.length} regulation{sourceRegs.length !== 1 ? 's' : ''}</h3>
+                    {sourceRegs.map(reg => (
+                      <div key={reg.id} style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 12, padding: mobile ? 14 : 20, marginBottom: 8, transition: 'border-color 0.2s' }}
+                        onMouseEnter={e => e.currentTarget.style.borderColor = T.accentDim}
+                        onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 }}>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 15, fontWeight: 700, color: T.text, marginBottom: 4 }}>{reg.title}</div>
+                            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
+                              <span style={{ padding: '2px 8px', background: T.glow, borderRadius: 4, fontSize: 11, fontWeight: 600, color: T.accent }}>{reg.category}</span>
+                              {reg.article_numbers && <span style={{ padding: '2px 8px', background: `${T.warning}15`, borderRadius: 4, fontSize: 11, fontWeight: 600, color: T.warning }}>{reg.article_numbers}</span>}
+                              {reg.document_name && <span style={{ fontSize: 11, color: T.dim }}>{reg.document_name}</span>}
+                            </div>
+                            {reg.summary && <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.5 }}>{reg.summary}</div>}
+                            <div style={{ fontSize: 11, color: T.dim, marginTop: 4 }}>{reg.content.length.toLocaleString()} chars</div>
+                          </div>
+                          <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                            <button onClick={() => startEdit(reg)} style={{ padding: '6px 12px', background: 'transparent', border: `1px solid ${T.border}`, borderRadius: 6, color: T.muted, fontSize: 12, cursor: 'pointer' }}>Edit</button>
+                            <button onClick={() => handleDelete(reg.id)} style={{ padding: '6px 12px', background: 'transparent', border: `1px solid rgba(239,68,68,0.3)`, borderRadius: 6, color: T.danger, fontSize: 12, cursor: 'pointer' }}>Remove</button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )
+              })}
+            </>
+          )}
+        </div>
+      )}
     </div>
   )
 }
