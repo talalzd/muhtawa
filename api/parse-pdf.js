@@ -1,13 +1,13 @@
-// /api/parse-pdf.js — Extract text from PDFs using Claude Vision
-// Handles scanned documents, Arabic text, and complex layouts
-// Uses Claude's document understanding capabilities
+// /api/parse-pdf.js — Extract text from PDF page images using Claude Vision
+// Handles scanned documents, Arabic text, tables, and complex layouts
+// Receives pre-rendered page images from the client
 
 import { createClient } from '@supabase/supabase-js'
 
 const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase())
 
 export const config = {
-  api: { bodyParser: { sizeLimit: '15mb' } }
+  api: { bodyParser: { sizeLimit: '25mb' } }
 }
 
 export default async function handler(req, res) {
@@ -36,83 +36,101 @@ export default async function handler(req, res) {
   const apiKey = process.env.ANTHROPIC_API_KEY
   if (!apiKey) return res.status(500).json({ error: 'AI service not configured' })
 
-  const { pdfBase64, fileName } = req.body || {}
-  if (!pdfBase64) return res.status(400).json({ error: 'No PDF data provided' })
+  const { pageImages, fileName, totalPages } = req.body || {}
 
-  // Check size (base64 is ~33% larger than binary)
-  if (pdfBase64.length > 20 * 1024 * 1024) {
-    return res.status(400).json({ error: 'File too large. Maximum 15MB.' })
+  if (!pageImages || !Array.isArray(pageImages) || pageImages.length === 0) {
+    return res.status(400).json({ error: 'No page images provided' })
   }
 
   try {
-    // Send PDF directly to Claude as a document
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 8192,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'document',
-                source: {
-                  type: 'base64',
-                  media_type: 'application/pdf',
-                  data: pdfBase64,
-                },
-              },
-              {
-                type: 'text',
-                text: `Extract ALL text from this PDF document. This is a Saudi government regulation document that may contain Arabic and English text.
+    // Process pages in batches of 5 (Claude handles up to 20 images per message)
+    const batchSize = 5
+    let fullText = ''
+
+    for (let i = 0; i < pageImages.length; i += batchSize) {
+      const batch = pageImages.slice(i, i + batchSize)
+      const startPage = i + 1
+      const endPage = i + batch.length
+
+      // Build content array with all page images in this batch
+      const content = []
+      batch.forEach((img, idx) => {
+        content.push({
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: 'image/png',
+            data: img,
+          },
+        })
+      })
+
+      content.push({
+        type: 'text',
+        text: `Extract ALL text from these ${batch.length} page(s) (pages ${startPage}-${endPage} of ${totalPages || 'unknown'}) of a Saudi government regulation document.
 
 Rules:
-- Extract every word of text from every page
-- Preserve the document structure (headings, articles, sections, numbered lists)
-- Keep article numbers and section numbers intact (e.g., "Article 11", "Section 3.2")
-- If text is in Arabic, keep it in Arabic
-- If there are tables, preserve them in a readable format
-- Separate pages with a line break
-- Do NOT summarize — extract the complete text as-is
-- Do NOT add commentary or analysis
+- Extract every single word from every page. Do not skip anything.
+- Preserve document structure: headings, article numbers, section numbers, numbered lists
+- Keep article numbers exactly as written (المادة الأولى، المادة الثانية، Article 1, etc.)
+- If text is in Arabic, keep it in Arabic exactly as written
+- If there are tables, extract them as structured text with clear column separation
+- Include all footnotes, headers, and marginal text
+- Separate each page with "--- Page ${startPage + batch.indexOf('PLACEHOLDER')} ---" (use actual page numbers)
+- Do NOT summarize or skip any content
+- Do NOT add your own commentary
 
-Output the full extracted text only.`,
-              },
-            ],
-          },
-        ],
-      }),
-    })
+Output the complete extracted text only.`,
+      })
 
-    if (!response.ok) {
-      const status = response.status
-      if (status === 429) return res.status(429).json({ error: 'AI service busy. Try again in a moment.' })
-      return res.status(500).json({ error: 'Failed to process PDF. Please try again.' })
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 16000,
+          messages: [{ role: 'user', content }],
+        }),
+      })
+
+      if (!response.ok) {
+        const status = response.status
+        if (status === 429) {
+          // Wait and retry once
+          await new Promise(r => setTimeout(r, 5000))
+          continue
+        }
+        return res.status(500).json({ 
+          error: `Failed to read pages ${startPage}-${endPage}. Please try again.`,
+          pagesProcessed: i,
+          partialText: fullText 
+        })
+      }
+
+      const data = await response.json()
+      const batchText = (data.content || [])
+        .filter(block => block.type === 'text')
+        .map(block => block.text)
+        .join('\n')
+
+      fullText += batchText + '\n\n'
     }
 
-    const data = await response.json()
-    const text = (data.content || [])
-      .filter(block => block.type === 'text')
-      .map(block => block.text)
-      .join('\n')
-
-    if (!text || text.trim().length < 10) {
-      return res.status(400).json({ error: 'Could not extract text from this PDF.' })
+    if (!fullText || fullText.trim().length < 20) {
+      return res.status(400).json({ error: 'Could not extract text from this document.' })
     }
 
     return res.status(200).json({
-      text: text.trim(),
+      text: fullText.trim(),
       fileName: fileName || 'unknown.pdf',
-      method: 'claude-vision',
+      pages: totalPages || pageImages.length,
     })
 
   } catch (error) {
-    return res.status(500).json({ error: 'Failed to process PDF. Please try again.' })
+    return res.status(500).json({ error: 'Failed to process document. Please try again.' })
   }
 }

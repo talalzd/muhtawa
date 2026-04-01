@@ -594,32 +594,78 @@ function RegulationsAdmin({ user, mobile }) {
     })()
   }, [])
 
-  // Upload and parse PDF — uses Claude Vision (handles scanned docs + Arabic)
+  // Upload and parse PDF — renders pages as images, sends to Claude Vision
+  const [parseProgress, setParseProgress] = useState('')
   const handlePdfUpload = async (e) => {
     const file = e.target.files?.[0]
     if (!file || !file.name.endsWith('.pdf')) { showToast('Please select a PDF file'); return }
-    if (file.size > 15 * 1024 * 1024) { showToast('File too large (max 15MB)'); return }
+    if (file.size > 20 * 1024 * 1024) { showToast('File too large (max 20MB)'); return }
 
     setParsing(true)
+    setParseProgress('Loading PDF...')
     try {
-      const base64 = await new Promise((resolve, reject) => {
+      // Load PDF.js for rendering pages as images
+      if (!window.pdfjsLib) {
+        await new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
+          script.onload = resolve
+          script.onerror = reject
+          document.head.appendChild(script)
+        })
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+      }
+
+      // Read file
+      const arrayBuffer = await new Promise((resolve, reject) => {
         const reader = new FileReader()
-        reader.onload = () => resolve(reader.result.split(',')[1])
+        reader.onload = () => resolve(reader.result)
         reader.onerror = reject
-        reader.readAsDataURL(file)
+        reader.readAsArrayBuffer(file)
       })
 
+      // Open PDF and render each page as image
+      const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise
+      const pageImages = []
+      setParseProgress(`Rendering ${pdf.numPages} pages...`)
+
+      for (let i = 1; i <= pdf.numPages; i++) {
+        setParseProgress(`Rendering page ${i} of ${pdf.numPages}...`)
+        const page = await pdf.getPage(i)
+        const scale = 2.0 // high res for better OCR
+        const viewport = page.getViewport({ scale })
+        const canvas = document.createElement('canvas')
+        canvas.width = viewport.width
+        canvas.height = viewport.height
+        const ctx = canvas.getContext('2d')
+        await page.render({ canvasContext: ctx, viewport }).promise
+        // Convert to PNG base64 (strip the data:image/png;base64, prefix)
+        const dataUrl = canvas.toDataURL('image/png', 0.85)
+        pageImages.push(dataUrl.split(',')[1])
+      }
+
+      setParseProgress(`Reading text with AI (${pdf.numPages} pages)... This may take 30-60 seconds.`)
+
+      // Send page images to server for Claude Vision OCR
       const headers = await getAuthHeader()
       const res = await fetch('/api/parse-pdf', {
         method: 'POST',
         headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pdfBase64: base64, fileName: file.name }),
+        body: JSON.stringify({ pageImages, fileName: file.name, totalPages: pdf.numPages }),
       })
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        showToast(err.error || 'Failed to read PDF. Try again.')
+        // If partial text was extracted, use it
+        if (err.partialText) {
+          setPdfText(err.partialText)
+          s('content', err.partialText)
+          showToast(`Partial extraction: ${err.error}`)
+        } else {
+          showToast(err.error || 'Failed to read PDF.')
+        }
         setParsing(false)
+        setParseProgress('')
         return
       }
 
@@ -627,11 +673,12 @@ function RegulationsAdmin({ user, mobile }) {
       setPdfText(data.text)
       s('content', data.text)
       s('document_name', file.name.replace('.pdf', ''))
-      showToast(`Text extracted from ${file.name}`)
+      showToast(`Extracted ${data.pages} pages from ${file.name}`)
     } catch (err) {
       showToast('Failed to parse PDF. Try copy-pasting the text instead.')
     }
     setParsing(false)
+    setParseProgress('')
     if (fileRef.current) fileRef.current.value = ''
   }
 
@@ -727,8 +774,8 @@ function RegulationsAdmin({ user, mobile }) {
             <input ref={fileRef} type="file" accept=".pdf" onChange={handlePdfUpload} style={{ display: 'none' }} />
             {parsing ? (
               <div style={{ color: T.accent, fontSize: 14 }}>
-                <div style={{ marginBottom: 4 }}>Reading PDF with AI...</div>
-                <div style={{ fontSize: 11, color: T.muted }}>This handles scanned documents and Arabic text. May take 15-30 seconds.</div>
+                <div style={{ marginBottom: 4 }}>{parseProgress || 'Processing...'}</div>
+                <div style={{ fontSize: 11, color: T.muted }}>Handles scanned documents and Arabic text.</div>
               </div>
             ) : (
               <>
