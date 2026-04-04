@@ -691,11 +691,15 @@ function RegulationsAdmin({ user, mobile }) {
       const method = editReg ? 'PUT' : 'POST'
       const body = editReg ? { id: editReg.id, ...form } : form
 
+      console.log('Saving regulation:', { method, title: form.title, hasAuth: !!headers.Authorization })
+
       const res = await fetch('/api/regulations', {
         method,
         headers: { ...headers, 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
+
+      console.log('Save response status:', res.status)
 
       if (res.ok) {
         const data = await res.json()
@@ -707,10 +711,15 @@ function RegulationsAdmin({ user, mobile }) {
         showToast(editReg ? 'Regulation updated' : 'Regulation saved')
         resetForm()
       } else {
-        const err = await res.json()
-        showToast(err.error || 'Failed to save')
+        let errMsg = `Save failed (${res.status})`
+        try { const err = await res.json(); errMsg = err.error || errMsg } catch {}
+        console.error('Save failed:', errMsg)
+        showToast(errMsg)
       }
-    } catch { showToast('Failed to save') }
+    } catch (e) {
+      console.error('Save error:', e)
+      showToast('Failed to save: ' + (e.message || 'Unknown error'))
+    }
     setSaving(false)
   }
 
@@ -759,7 +768,7 @@ function RegulationsAdmin({ user, mobile }) {
         {mode === 'list' && <button onClick={() => setMode('add')} style={{ ...btnP, padding: '10px 20px', fontSize: 13 }}>+ Add Regulation</button>}
       </div>
 
-      {toast && <div className="fade-in" style={{ padding: '10px 16px', background: T.glow, border: '1px solid rgba(16,185,129,0.3)', borderRadius: 8, color: T.accent, fontSize: 13, marginBottom: 16 }}>{toast}</div>}
+      {toast && <div className="fade-in" style={{ padding: '10px 16px', background: /fail|error|required/i.test(toast) ? 'rgba(239,68,68,0.15)' : T.glow, border: `1px solid ${/fail|error|required/i.test(toast) ? 'rgba(239,68,68,0.3)' : 'rgba(16,185,129,0.3)'}`, borderRadius: 8, color: /fail|error|required/i.test(toast) ? T.danger : T.accent, fontSize: 13, marginBottom: 16 }}>{toast}</div>}
 
       {/* ADD / EDIT FORM */}
       {(mode === 'add' || mode === 'edit') && (
