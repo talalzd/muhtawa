@@ -20,76 +20,23 @@ function checkRateLimit(ip) {
   return true
 }
 
-// Extract keywords from user message for regulation matching
-function extractKeywords(messages) {
-  const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')
-  if (!lastUserMsg) return ''
-  return lastUserMsg.content
-}
-
-// Fetch relevant regulations from Supabase
-async function getRelevantRegulations(query) {
+// Fetch ALL regulations — with only 5-15 documents, load everything
+// Claude can read through all of them and find the right answer
+async function getAllRegulations() {
   const supabaseUrl = process.env.VITE_SUPABASE_URL
   const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY
   if (!supabaseUrl || !supabaseKey) return []
 
   const supabase = createClient(supabaseUrl, supabaseKey)
 
-  // Try full-text search first
-  const { data: searchResults } = await supabase
-    .rpc('search_regulations', { query, max_results: 5 })
-
-  if (searchResults && searchResults.length > 0) return searchResults
-
-  // Fallback: category-based keyword matching
-  const categoryMap = {
-    'eligib': 'Eligibility',
-    'threshold': 'Thresholds',
-    'score': 'Scoring Methodology',
-    'calculat': 'Scoring Methodology',
-    'submit': 'Submission Process',
-    'document': 'Submission Process',
-    'exempt': 'Exemptions',
-    'penalt': 'Penalties',
-    'made in saudi': 'Made in Saudi',
-    'product': 'Made in Saudi',
-    'procure': 'Procurement Rules',
-    'tender': 'Procurement Rules',
-    'bid': 'Procurement Rules',
-    'expro': 'Procurement Rules',
-    'labor': 'Scoring Methodology',
-    'saudiz': 'Scoring Methodology',
-    'supplier': 'Scoring Methodology',
-    'training': 'Scoring Methodology',
-    'depreciat': 'Scoring Methodology',
-  }
-
-  const queryLower = query.toLowerCase()
-  const matchedCategories = []
-  for (const [keyword, category] of Object.entries(categoryMap)) {
-    if (queryLower.includes(keyword) && !matchedCategories.includes(category)) {
-      matchedCategories.push(category)
-    }
-  }
-
-  if (matchedCategories.length === 0) {
-    // If no specific match, get a general set
-    const { data } = await supabase
-      .from('regulations')
-      .select('*')
-      .eq('is_active', true)
-      .limit(3)
-    return data || []
-  }
-
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from('regulations')
-    .select('*')
+    .select('source, title, category, document_name, article_numbers, content, summary')
     .eq('is_active', true)
-    .in('category', matchedCategories)
-    .limit(5)
+    .order('source')
 
-  return data || []
+  if (error || !data) return []
+  return data
 }
 
 export default async function handler(req, res) {
@@ -121,26 +68,29 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Fetch relevant regulations based on user's question
-    const userQuery = extractKeywords(messages)
-    const regulations = await getRelevantRegulations(userQuery)
+    // Load ALL regulations — only 5-15 docs, Claude reads through all of them
+    const regulations = await getAllRegulations()
 
-    // Build enhanced system prompt with regulation context
+    // Build enhanced system prompt with full regulation context
     let enhancedSystem = system || ''
 
     if (regulations.length > 0) {
-      enhancedSystem += '\n\n═══ OFFICIAL REGULATIONS (cite these by source, article, and document name) ═══\n\n'
+      enhancedSystem += '\n\n═══ OFFICIAL REGULATIONS DATABASE ═══\nYou have access to ALL of the following regulations. Search through ALL of them to find the answer.\nAlways cite the specific source, document name, and article number when answering.\n\n'
       regulations.forEach((reg, i) => {
-        enhancedSystem += `── REGULATION ${i + 1} ──\n`
+        enhancedSystem += `── REGULATION ${i + 1}: ${reg.title} ──\n`
         enhancedSystem += `Source: ${reg.source}\n`
         enhancedSystem += `Document: ${reg.document_name || reg.title}\n`
         enhancedSystem += `Category: ${reg.category}\n`
         if (reg.article_numbers) enhancedSystem += `Articles: ${reg.article_numbers}\n`
         if (reg.summary) enhancedSystem += `Summary: ${reg.summary}\n`
-        enhancedSystem += `Content:\n${reg.content}\n\n`
+        enhancedSystem += `Full Content:\n${reg.content}\n\n`
       })
-      enhancedSystem += '═══ END REGULATIONS ═══\n\n'
-      enhancedSystem += 'IMPORTANT: When answering, always cite the specific regulation source, document name, and article number from the regulations above. If the answer is not covered by the regulations provided, say so and provide general guidance based on LCGPA scoring rules.'
+      enhancedSystem += '═══ END OF REGULATIONS DATABASE ═══\n\n'
+      enhancedSystem += 'CRITICAL INSTRUCTIONS:\n'
+      enhancedSystem += '- You MUST search through ALL regulations above before saying you do not have access to something.\n'
+      enhancedSystem += '- Always cite: Source (LCGPA/EXPRO), Document Name, and Article Number.\n'
+      enhancedSystem += '- If the answer spans multiple regulations, cite all relevant ones.\n'
+      enhancedSystem += '- Only say "not available in my knowledge base" if you have genuinely searched all regulations above and the topic is not covered.\n'
     }
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -152,7 +102,7 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
+        max_tokens: 2048,
         system: enhancedSystem,
         messages: messages.slice(-10),
       }),
