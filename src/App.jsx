@@ -799,10 +799,10 @@ function RegulationsAdmin({ user, mobile }) {
           <div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 16, marginBottom: 16 }}>
             <div>
               <label style={labelStyle}>Source</label>
-              <select value={form.source} onChange={e => s('source', e.target.value)} style={{ ...inputStyle, cursor: 'pointer' }}>
-                <option value="LCGPA">LCGPA</option>
-                <option value="EXPRO">EXPRO</option>
-              </select>
+              <input list="source-list" value={form.source} onChange={e => s('source', e.target.value)} placeholder="e.g., LCGPA, EXPRO, MISA, MOF" style={inputStyle} />
+              <datalist id="source-list">
+                {[...new Set(['LCGPA', 'EXPRO', 'MISA', 'MOF', 'SDAIA', 'MCI', ...regs.map(r => r.source)])].map(src => <option key={src} value={src} />)}
+              </datalist>
             </div>
             <div>
               <label style={labelStyle}>Category</label>
@@ -862,7 +862,7 @@ function RegulationsAdmin({ user, mobile }) {
             </div>
           ) : (
             <>
-              {['LCGPA', 'EXPRO'].map(source => {
+              {[...new Set(regs.map(r => r.source))].sort().map(source => {
                 const sourceRegs = regs.filter(r => r.source === source)
                 if (sourceRegs.length === 0) return null
                 return (
