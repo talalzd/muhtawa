@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { supabase, signUp, signIn, signOut, getSession, saveCompany, getCompany, saveAssessment, getAssessments, submitFeedback } from './lib/supabase.js'
-import { SECTORS, PRODUCT_CATEGORIES, LC_THRESHOLD } from './lib/sectors.js'
+import { SECTORS, PRODUCT_CATEGORIES, LC_THRESHOLD, ASSET_TYPES, TEMPLATE_VERSION } from './lib/sectors.js'
 import { computeScore, getRecommendations, fmt, pct, TOOLTIPS } from './lib/scoring.js'
 import { exportAssessmentPDF } from './lib/pdf.js'
 
@@ -24,6 +24,17 @@ function isAdminUser(email) {
   return false
 }
 
+// ─── Shared auth header helper ─────────────────────────────────────────
+async function getAuthHeader() {
+  if (!supabase) return {}
+  try {
+    const { data: { session } } = await supabase.auth.getSession()
+    return session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : {}
+  } catch {
+    return {}
+  }
+}
+
 // ─── #10: SANITIZE ERROR MESSAGES ──────────────────────────────────────
 function sanitizeError(msg) {
   if (!msg) return 'Something went wrong. Please try again.'
@@ -40,7 +51,7 @@ function sanitizeError(msg) {
   return raw
 }
 
-// ─── #9: RATE LIMITER ──────────────────────────────────────────────────
+// ─── #9: RATE LIMITER (client-side UX only) ────────────────────────────
 function useRateLimit(maxCalls, windowMs) {
   const calls = useRef([])
   return useCallback(() => {
@@ -72,7 +83,7 @@ const TEAM_QUESTIONS = [
 ]
 
 function emptyAssessment() {
-  return { id: Date.now(), date: new Date().toISOString(), labor: { saudiComp: 0, foreignComp: 0 }, suppliers: [], training: 0, supplierDev: 0, rdExpense: 0, totalRevenue: 0, assets: [], otherCosts: 0, inventoryMovement: 0 }
+  return { id: Date.now(), date: new Date().toISOString(), labor: { saudiComp: 0, foreignComp: 0 }, suppliers: [], training: 0, supplierDev: 0, rdExpense: 0, totalRevenue: 0, assets: [], totalGSExpense: 0, otherCosts: 0, inventoryMovement: 0 }
 }
 
 // ─── #13: RESPONSIVE HOOK ──────────────────────────────────────────────
@@ -401,7 +412,7 @@ function Calculator({ assessment, onSave, company, onExport, mobile }) {
   const addSup = () => upd('suppliers', [...a.suppliers, { name: '', sectorId: 1, sectorScore: SECTORS[0].score, auditedScore: 0, expense: 0, origin: 'Local' }])
   const updSup = (i, k, v) => { const ns = [...a.suppliers]; ns[i] = { ...ns[i], [k]: v }; if (k === 'sectorId') { const sec = SECTORS.find(x => x.id === v); if (sec) ns[i].sectorScore = sec.score }; upd('suppliers', ns) }
   const rmSup = i => upd('suppliers', a.suppliers.filter((_, j) => j !== i))
-  const addAsset = () => upd('assets', [...a.assets, { name: '', amount: 0, producedInKSA: true }])
+  const addAsset = () => upd('assets', [...a.assets, { name: '', assetType: 'MACHINERY', amount: 0, producedInKSA: true }])
   const updAsset = (i, k, v) => { const na = [...a.assets]; na[i] = { ...na[i], [k]: v }; upd('assets', na) }
   const rmAsset = i => upd('assets', a.assets.filter((_, j) => j !== i))
 
@@ -410,7 +421,7 @@ function Calculator({ assessment, onSave, company, onExport, mobile }) {
   return (
     <div className="fade-in">
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
-        <div><h1 style={{ fontSize: mobile ? 22 : 28, fontWeight: 800, letterSpacing: '-0.02em', color: T.text, marginBottom: 4 }}>LC Score Calculator</h1><p style={{ fontSize: 13, color: T.muted }}>LCGPA Template V7 — Auto-saves</p></div>
+        <div><h1 style={{ fontSize: mobile ? 22 : 28, fontWeight: 800, letterSpacing: '-0.02em', color: T.text, marginBottom: 4 }}>LC Score Calculator</h1><p style={{ fontSize: 13, color: T.muted }}>LCGPA Template {TEMPLATE_VERSION} — Auto-saves</p></div>
         <button onClick={() => onExport(a)} style={{ ...btnP, padding: '8px 16px', fontSize: 13 }}>↓ PDF</button>
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: mobile ? 'repeat(2, 1fr)' : 'repeat(5, 1fr)', gap: 10, marginBottom: 16 }}>
@@ -428,10 +439,10 @@ function Calculator({ assessment, onSave, company, onExport, mobile }) {
         {tabs.map(t => <button key={t.id} onClick={() => setTab(t.id)} style={{ flex: mobile ? 'none' : 1, padding: mobile ? '8px 12px' : '10px 12px', background: tab === t.id ? T.glow : 'transparent', border: tab === t.id ? '1px solid rgba(16,185,129,0.3)' : '1px solid transparent', borderRadius: 8, color: tab === t.id ? T.accent : T.muted, fontSize: mobile ? 12 : 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 4, justifyContent: 'center' }}>{!mobile && <span>{t.icon}</span>} {t.label}</button>)}
       </div>
       <div style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 16, padding: mobile ? 16 : 28 }}>
-        {tab === 'labor' && <><SH title="Section 3: Labor" desc="Saudi at 100%, foreign at 37%." /><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 16 }}><div><label style={labelStyle}>Saudi Compensation (SAR)<Tip tipKey="saudiComp" /></label><input type="number" value={a.labor.saudiComp || ''} onChange={e => upd('labor.saudiComp', Number(e.target.value))} placeholder="0" style={inputStyle} /><div style={{ fontSize: 12, color: T.accent, marginTop: 4 }}>100% → SAR {fmt(a.labor.saudiComp || 0)}</div></div><div><label style={labelStyle}>Foreign Compensation (SAR)<Tip tipKey="foreignComp" /></label><input type="number" value={a.labor.foreignComp || ''} onChange={e => upd('labor.foreignComp', Number(e.target.value))} placeholder="0" style={inputStyle} /><div style={{ fontSize: 12, color: T.dim, marginTop: 4 }}>37% → SAR {fmt((a.labor.foreignComp || 0) * 0.37)}</div></div></div><TB label="Total Labor LC" value={`SAR ${fmt(score.laborLC)}`} /></>}
-        {tab === 'goods' && <><SH title="Section 4: Goods & Services" desc="List top suppliers by sector LC %." />{a.suppliers.map((sup, i) => <div key={i} style={{ padding: mobile ? 12 : 16, border: `1px solid ${T.border}`, borderRadius: 10, marginBottom: 12, position: 'relative' }}><button onClick={() => rmSup(i)} style={{ position: 'absolute', top: 8, right: 8, background: 'none', border: 'none', color: T.danger, cursor: 'pointer', fontSize: 16, padding: 4 }}>✕</button><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '2fr 1fr 2fr 1fr', gap: 12, alignItems: 'end' }}><div><label style={labelStyle}>Supplier<Tip tipKey="supplierName" /></label><input value={sup.name} onChange={e => updSup(i, 'name', e.target.value)} placeholder="Name" style={inputStyle} /></div><div><label style={labelStyle}>Origin</label><select value={sup.origin} onChange={e => updSup(i, 'origin', e.target.value)} style={{ ...inputStyle, cursor: 'pointer' }}><option value="Local">Local</option><option value="Foreign">Foreign</option></select></div><div><label style={labelStyle}>Sector<Tip tipKey="supplierSector" /></label><select value={sup.sectorId} onChange={e => updSup(i, 'sectorId', Number(e.target.value))} style={{ ...inputStyle, cursor: 'pointer', fontSize: 12 }}>{SECTORS.map(sec => <option key={sec.id} value={sec.id}>{sec.name} ({pct(sec.score)})</option>)}</select></div><div><label style={labelStyle}>Expense (SAR)<Tip tipKey="supplierExpense" /></label><input type="number" value={sup.expense || ''} onChange={e => updSup(i, 'expense', Number(e.target.value))} placeholder="0" style={inputStyle} /></div></div><div style={{ fontSize: 12, color: T.accent, marginTop: 8 }}>LC: SAR {fmt((sup.expense || 0) * (sup.auditedScore > 0 ? sup.auditedScore : (sup.sectorScore || 0)))}</div></div>)}<button onClick={addSup} style={{ padding: '10px 20px', background: 'transparent', border: `1px dashed ${T.border}`, borderRadius: 8, color: T.muted, fontSize: 13, cursor: 'pointer', width: '100%' }}>+ Add Supplier</button><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 16, marginTop: 16 }}><div><label style={labelStyle}>Other Costs (SAR)<Tip tipKey="otherCosts" /></label><input type="number" value={a.otherCosts || ''} onChange={e => upd('otherCosts', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>Inventory Movement<Tip tipKey="inventoryMovement" /></label><input type="number" value={a.inventoryMovement || ''} onChange={e => upd('inventoryMovement', Number(e.target.value))} placeholder="0" style={inputStyle} /></div></div><TB label="Total G&S LC" value={`SAR ${fmt(score.gsLC)}`} /></>}
-        {tab === 'capacity' && <><SH title="Section 5: Capacity Building" desc="Training, supplier dev, R&D." /><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 16 }}><div><label style={labelStyle}>Saudi Training (SAR)<Tip tipKey="training" /></label><input type="number" value={a.training || ''} onChange={e => upd('training', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>Supplier Development (SAR)<Tip tipKey="supplierDev" /></label><input type="number" value={a.supplierDev || ''} onChange={e => upd('supplierDev', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>R&D in KSA (SAR)<Tip tipKey="rdExpense" /></label><input type="number" value={a.rdExpense || ''} onChange={e => upd('rdExpense', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>Total Revenue (SAR)<Tip tipKey="totalRevenue" /></label><input type="number" value={a.totalRevenue || ''} onChange={e => upd('totalRevenue', Number(e.target.value))} placeholder="0" style={inputStyle} /><div style={{ fontSize: 12, color: score.rdIncentive > 0 ? T.accent : T.dim, marginTop: 4 }}>R&D Incentive: {pct(score.rdIncentive)}</div></div></div><TB label="Total Capacity LC" value={`SAR ${fmt(score.capacityLC)}`} /></>}
-        {tab === 'depreciation' && <><SH title="Section 6: Depreciation" desc="KSA-produced 100%, foreign 20%." />{a.assets.map((ast, i) => <div key={i} style={{ padding: mobile ? 12 : 16, border: `1px solid ${T.border}`, borderRadius: 10, marginBottom: 12, position: 'relative' }}><button onClick={() => rmAsset(i)} style={{ position: 'absolute', top: 8, right: 8, background: 'none', border: 'none', color: T.danger, cursor: 'pointer', fontSize: 16, padding: 4 }}>✕</button><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '2fr 1fr 1fr', gap: 12, alignItems: 'end' }}><div><label style={labelStyle}>Asset<Tip tipKey="assetName" /></label><input value={ast.name} onChange={e => updAsset(i, 'name', e.target.value)} placeholder="e.g., Machinery" style={inputStyle} /></div><div><label style={labelStyle}>Amount (SAR)<Tip tipKey="assetAmount" /></label><input type="number" value={ast.amount || ''} onChange={e => updAsset(i, 'amount', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>Made in KSA?<Tip tipKey="assetKSA" /></label><select value={ast.producedInKSA ? 'yes' : 'no'} onChange={e => updAsset(i, 'producedInKSA', e.target.value === 'yes')} style={{ ...inputStyle, cursor: 'pointer' }}><option value="yes">Yes (100%)</option><option value="no">No (20%)</option></select></div></div><div style={{ fontSize: 12, color: T.accent, marginTop: 8 }}>LC: SAR {fmt((ast.amount || 0) * (ast.producedInKSA ? 1 : 0.2))}</div></div>)}<button onClick={addAsset} style={{ padding: '10px 20px', background: 'transparent', border: `1px dashed ${T.border}`, borderRadius: 8, color: T.muted, fontSize: 13, cursor: 'pointer', width: '100%' }}>+ Add Asset</button><TB label="Total Depreciation LC" value={`SAR ${fmt(score.depLC)}`} /></>}
+        {tab === 'labor' && <><SH title="Section 3: Labor" desc="Saudi at 100%, foreign at 53.4%." /><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 16 }}><div><label style={labelStyle}>Saudi Compensation (SAR)<Tip tipKey="saudiComp" /></label><input type="number" value={a.labor.saudiComp || ''} onChange={e => upd('labor.saudiComp', Number(e.target.value))} placeholder="0" style={inputStyle} /><div style={{ fontSize: 12, color: T.accent, marginTop: 4 }}>100% → SAR {fmt(a.labor.saudiComp || 0)}</div></div><div><label style={labelStyle}>Foreign Compensation (SAR)<Tip tipKey="foreignComp" /></label><input type="number" value={a.labor.foreignComp || ''} onChange={e => upd('labor.foreignComp', Number(e.target.value))} placeholder="0" style={inputStyle} /><div style={{ fontSize: 12, color: T.dim, marginTop: 4 }}>53.4% → SAR {fmt((a.labor.foreignComp || 0) * 0.534)}</div></div></div><TB label="Total Labor LC" value={`SAR ${fmt(score.laborLC)}`} /></>}
+        {tab === 'goods' && <><SH title="Section 4: Goods & Services" desc="Enter total G&S expense, then list top suppliers (≥70% of spend or top 40)." /><div style={{ marginBottom: 16 }}><label style={labelStyle}>Total G&S Expense (SAR)<Tip tipKey="totalGSExpense" /></label><input type="number" value={a.totalGSExpense || ''} onChange={e => upd('totalGSExpense', Number(e.target.value))} placeholder="0" style={inputStyle} />{score.declaredTotalGS > 0 && score.listedSupplierExpense > 0 && <div style={{ fontSize: 12, color: (score.listedSupplierExpense / score.declaredTotalGS) >= 0.7 ? T.accent : T.warning, marginTop: 4 }}>Supplier coverage: {pct(score.listedSupplierExpense / score.declaredTotalGS)}{score.remainingGS > 0 && ` • Remaining SAR ${fmt(score.remainingGS)} scored at weighted avg ${pct(score.weightedAvgLC)}`}</div>}</div>{a.suppliers.map((sup, i) => <div key={i} style={{ padding: mobile ? 12 : 16, border: `1px solid ${T.border}`, borderRadius: 10, marginBottom: 12, position: 'relative' }}><button onClick={() => rmSup(i)} style={{ position: 'absolute', top: 8, right: 8, background: 'none', border: 'none', color: T.danger, cursor: 'pointer', fontSize: 16, padding: 4 }}>✕</button><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '2fr 1fr 2fr 1fr', gap: 12, alignItems: 'end' }}><div><label style={labelStyle}>Supplier<Tip tipKey="supplierName" /></label><input value={sup.name} onChange={e => updSup(i, 'name', e.target.value)} placeholder="Name" style={inputStyle} /></div><div><label style={labelStyle}>Origin</label><select value={sup.origin} onChange={e => updSup(i, 'origin', e.target.value)} style={{ ...inputStyle, cursor: 'pointer' }}><option value="Local">Local</option><option value="Foreign">Foreign</option></select></div><div><label style={labelStyle}>Sector<Tip tipKey="supplierSector" /></label><select value={sup.sectorId} onChange={e => updSup(i, 'sectorId', Number(e.target.value))} style={{ ...inputStyle, cursor: 'pointer', fontSize: 12 }}>{SECTORS.map(sec => <option key={sec.id} value={sec.id}>{sec.name} ({pct(sec.score)})</option>)}</select></div><div><label style={labelStyle}>Expense (SAR)<Tip tipKey="supplierExpense" /></label><input type="number" value={sup.expense || ''} onChange={e => updSup(i, 'expense', Number(e.target.value))} placeholder="0" style={inputStyle} /></div></div><div style={{ fontSize: 12, color: T.accent, marginTop: 8 }}>LC: SAR {fmt((sup.expense || 0) * (sup.auditedScore > 0 ? sup.auditedScore : (sup.sectorScore || 0)))}</div></div>)}<button onClick={addSup} style={{ padding: '10px 20px', background: 'transparent', border: `1px dashed ${T.border}`, borderRadius: 8, color: T.muted, fontSize: 13, cursor: 'pointer', width: '100%' }}>+ Add Supplier</button><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 16, marginTop: 16 }}><div><label style={labelStyle}>Other Costs (SAR)<Tip tipKey="otherCosts" /></label><input type="number" value={a.otherCosts || ''} onChange={e => upd('otherCosts', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>Inventory Movement<Tip tipKey="inventoryMovement" /></label><input type="number" value={a.inventoryMovement || ''} onChange={e => upd('inventoryMovement', Number(e.target.value))} placeholder="0" style={inputStyle} /></div></div><TB label="Total G&S LC" value={`SAR ${fmt(score.gsLC)}`} /></>}
+        {tab === 'capacity' && <><SH title="Section 6: Capacity Building" desc="Training, supplier dev, R&D — all at 100% LC. R&D also earns up to 10% bonus." /><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 16 }}><div><label style={labelStyle}>Saudi Training (SAR)<Tip tipKey="training" /></label><input type="number" value={a.training || ''} onChange={e => upd('training', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>Supplier Development (SAR)<Tip tipKey="supplierDev" /></label><input type="number" value={a.supplierDev || ''} onChange={e => upd('supplierDev', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>R&D in KSA (SAR)<Tip tipKey="rdExpense" /></label><input type="number" value={a.rdExpense || ''} onChange={e => upd('rdExpense', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>Total Revenue (SAR)<Tip tipKey="totalRevenue" /></label><input type="number" value={a.totalRevenue || ''} onChange={e => upd('totalRevenue', Number(e.target.value))} placeholder="0" style={inputStyle} /><div style={{ fontSize: 12, color: score.rdIncentive > 0 ? T.accent : T.dim, marginTop: 4 }}>R&D Incentive: {pct(score.rdIncentive)} (added to final score)</div></div></div><TB label="Total Capacity LC" value={`SAR ${fmt(score.capacityLC)}`} /></>}
+        {tab === 'depreciation' && <><SH title="Section 7: Depreciation & Amortization" desc="KSA-produced 100%, foreign 30%. Buildings & Land Improvements in KSA always 100%." />{a.assets.map((ast, i) => { const typeDef = ASSET_TYPES.find(t => t.id === ast.assetType); const isBuilding = !!(typeDef && typeDef.alwaysLocal); const factor = isBuilding ? 1 : (ast.producedInKSA ? 1 : 0.3); return (<div key={i} style={{ padding: mobile ? 12 : 16, border: `1px solid ${T.border}`, borderRadius: 10, marginBottom: 12, position: 'relative' }}><button onClick={() => rmAsset(i)} style={{ position: 'absolute', top: 8, right: 8, background: 'none', border: 'none', color: T.danger, cursor: 'pointer', fontSize: 16, padding: 4 }}>✕</button><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '2fr 2fr 1fr 1fr', gap: 12, alignItems: 'end' }}><div><label style={labelStyle}>Description<Tip tipKey="assetName" /></label><input value={ast.name} onChange={e => updAsset(i, 'name', e.target.value)} placeholder="e.g., Headquarters building" style={inputStyle} /></div><div><label style={labelStyle}>Asset Class<Tip tipKey="assetType" /></label><select value={ast.assetType || 'MACHINERY'} onChange={e => updAsset(i, 'assetType', e.target.value)} style={{ ...inputStyle, cursor: 'pointer', fontSize: 12 }}>{ASSET_TYPES.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}</select></div><div><label style={labelStyle}>Amount (SAR)<Tip tipKey="assetAmount" /></label><input type="number" value={ast.amount || ''} onChange={e => updAsset(i, 'amount', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>Made in KSA?<Tip tipKey="assetKSA" /></label><select value={isBuilding ? 'yes' : (ast.producedInKSA ? 'yes' : 'no')} onChange={e => updAsset(i, 'producedInKSA', e.target.value === 'yes')} disabled={isBuilding} style={{ ...inputStyle, cursor: isBuilding ? 'not-allowed' : 'pointer', opacity: isBuilding ? 0.6 : 1 }}><option value="yes">Yes (100%)</option><option value="no">No (30%)</option></select></div></div><div style={{ fontSize: 12, color: T.accent, marginTop: 8 }}>LC: SAR {fmt((ast.amount || 0) * factor)}{isBuilding && ' • Building in KSA: always 100%'}</div></div>)})}<button onClick={addAsset} style={{ padding: '10px 20px', background: 'transparent', border: `1px dashed ${T.border}`, borderRadius: 8, color: T.muted, fontSize: 13, cursor: 'pointer', width: '100%' }}>+ Add Asset</button><TB label="Total Depreciation LC" value={`SAR ${fmt(score.depLC)}`} /></>}
         {tab === 'summary' && <><SH title="Summary & Recommendations" desc="Full breakdown." /><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 12, marginBottom: 20 }}>{[{ l: 'Labor', v: score.laborLC, t: score.laborTotal }, { l: 'G&S', v: score.gsLC, t: score.gsTotal }, { l: 'Capacity', v: score.capacityLC, t: 0 }, { l: 'Depreciation', v: score.depLC, t: score.depTotal }].map((x, i) => <div key={i} style={{ padding: 14, background: T.bgInput, borderRadius: 10, border: `1px solid ${T.border}` }}><div style={{ fontSize: 12, color: T.muted, fontWeight: 600, marginBottom: 4 }}>{x.l}</div><div style={{ fontSize: 18, fontWeight: 800, color: T.accent }}>SAR {fmt(x.v)}</div>{x.t > 0 && <div style={{ fontSize: 11, color: T.dim }}>of SAR {fmt(x.t)}</div>}</div>)}</div><h4 style={{ fontSize: 15, fontWeight: 700, color: T.text, marginBottom: 12 }}>Recommendations</h4>{recs.map((r, i) => { const c = { critical: T.danger, warning: T.warning, info: '#3b82f6', success: T.success }; return <div key={i} style={{ padding: '12px 14px', borderRadius: 10, marginBottom: 8, border: `1px solid ${c[r.type]}33`, background: `${c[r.type]}0a` }}><div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}><div style={{ fontSize: 13, fontWeight: 700, color: c[r.type] }}>{r.title}</div>{r.ref && <div style={{ fontSize: 10, color: T.dim, fontStyle: 'italic' }}>{r.ref}</div>}</div><div style={{ fontSize: 13, color: T.text, lineHeight: 1.6 }}>{r.text}</div></div> })}</>}
       </div>
     </div>
@@ -487,22 +498,22 @@ function MadeInSaudi({ mobile }) {
   )
 }
 
-// ═══ AI ADVISOR (#3: API failure, #9: rate limited) ═══
+// ═══ AI ADVISOR (#3: API failure, #9: rate limited, auth required) ═══
 function Advisor({ company, currentAssessment, mobile }) {
   const [msgs, setMsgs] = useState([{ role: 'assistant', content: "I'm your Local Content compliance advisor. I can help you understand LCGPA requirements and recommend actions to improve your score.\n\nTry asking:\n• \"What do I need to reach 40%?\"\n• \"How is labor scored?\"\n• \"What sectors have highest LC?\"\n• \"Do subcontractors need to comply?\"" }])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const ref = useRef(null)
   const score = currentAssessment ? computeScore(currentAssessment) : null
-  const checkRate = useRateLimit(10, 60000) // #9: 10 messages per minute
+  const checkRate = useRateLimit(10, 60000) // #9: 10 messages per minute (client-side UX)
 
   useEffect(() => { if (ref.current) ref.current.scrollTop = ref.current.scrollHeight }, [msgs])
 
   const ctx = () => {
-    let c = `You are Muhtawa AI Compliance Advisor, expert on Saudi LCGPA requirements.\n\nKEY RULES:\n- Min LC score for govt procurement: 40%\n- LC Score = Total LC / Total Cost\n- Labor: Saudi 100%, foreign 37%\n- G&S: 39 sectors with predefined scores\n- Capacity: Training + supplier dev + R&D (10% incentive at 2% revenue)\n- Depreciation: KSA 100%, foreign 20%\n\nSECTORS:\n${SECTORS.map(s => `${s.name}: ${pct(s.score)}`).join('\n')}\n`
+    let c = `You are Muhtawa AI Compliance Advisor, expert on Saudi LCGPA requirements (Template ${TEMPLATE_VERSION}).\n\nKEY RULES (V2):\n- Min LC score for govt procurement: 40%\n- Final LC % = min(100%, (TotalLC / TotalCost) + R&D Incentive)\n- Labor: Saudi 100%, foreign 53.4%\n- G&S: 38 sectors with predefined scores; weighted-avg applies to inventory and remaining G&S\n- Capacity (Section 6): Training + supplier dev + R&D all at 100% (R&D also earns up to 10% bonus at 2% of revenue)\n- Depreciation (Section 7): KSA 100%, foreign 30%. Buildings & Land Improvements in KSA always 100%.\n\nSECTORS:\n${SECTORS.map(s => `${s.name}: ${pct(s.score)}`).join('\n')}\n`
     if (company) c += `\nCOMPANY: ${company.name}, Sector: ${company.sector}`
-    if (score) c += `\nSCORE: ${pct(score.totalScore)} | Labor: SAR ${fmt(score.laborLC)}/${fmt(score.laborTotal)} | G&S: SAR ${fmt(score.gsLC)}/${fmt(score.gsTotal)} | Capacity: SAR ${fmt(score.capacityLC)} | Dep: SAR ${fmt(score.depLC)}/${fmt(score.depTotal)} | Total: SAR ${fmt(score.totalLC)}/${fmt(score.totalCost)}`
-    c += '\n\nReference LCGPA sections. Give prescriptive recommendations with numbers. Be direct.'
+    if (score) c += `\nSCORE: ${pct(score.totalScore)} (ratio ${pct(score.rawLcRatio)} + R&D ${pct(score.rdIncentive)}) | Labor: SAR ${fmt(score.laborLC)}/${fmt(score.laborTotal)} | G&S: SAR ${fmt(score.gsLC)}/${fmt(score.gsTotal)} | Capacity: SAR ${fmt(score.capacityLC)} | Dep: SAR ${fmt(score.depLC)}/${fmt(score.depTotal)} | Total: SAR ${fmt(score.totalLC)}/${fmt(score.totalCost)}`
+    c += '\n\nReference LCGPA V2 sections. Give prescriptive recommendations with numbers. Be direct.'
     return c
   }
 
@@ -516,8 +527,11 @@ function Advisor({ company, currentAssessment, mobile }) {
       // #3: timeout and graceful failure
       const controller = new AbortController()
       const timeout = setTimeout(() => controller.abort(), 30000) // 30s timeout
+      // Include auth token — chat endpoint now requires authenticated user
+      const authHeader = await getAuthHeader()
       const res = await fetch('/api/chat', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeader },
         body: JSON.stringify({ system: ctx(), messages: [...msgs.filter((_, i) => i > 0), um].map(m => ({ role: m.role, content: m.content })) }),
         signal: controller.signal
       })
@@ -531,9 +545,17 @@ function Advisor({ company, currentAssessment, mobile }) {
       setMsgs(p => [...p, { role: 'assistant', content: text }])
     } catch (e) {
       // #3 & #10: graceful failure with safe error message
-      const msg = e.name === 'AbortError'
-        ? 'Request timed out. The AI service may be busy. Please try again.'
-        : 'Unable to reach the AI service. Please check your connection and try again.'
+      const raw = e?.message || ''
+      let msg
+      if (e.name === 'AbortError') {
+        msg = 'Request timed out. The AI service may be busy. Please try again.'
+      } else if (/sign in|401/i.test(raw)) {
+        msg = 'Your session has expired. Please sign out and sign back in.'
+      } else if (/rate limit|429/i.test(raw)) {
+        msg = 'You are sending messages too fast. Please wait a moment.'
+      } else {
+        msg = 'Unable to reach the AI service. Please check your connection and try again.'
+      }
       setMsgs(p => [...p, { role: 'assistant', content: msg }])
     }
     setBusy(false)
@@ -556,6 +578,8 @@ function Advisor({ company, currentAssessment, mobile }) {
 }
 
 // ═══ REGULATIONS ADMIN ═══
+// PDF upload has been removed. To add a regulation, paste the text into
+// the Content field (use Gemini or similar to extract text from PDFs).
 const REG_CATEGORIES = ['Eligibility', 'Scoring Methodology', 'Submission Process', 'Thresholds', 'Exemptions', 'Penalties', 'Made in Saudi', 'Procurement Rules', 'General', 'Other']
 
 function RegulationsAdmin({ user, mobile }) {
@@ -563,21 +587,12 @@ function RegulationsAdmin({ user, mobile }) {
   const [loading, setLoading] = useState(true)
   const [mode, setMode] = useState('list') // list, add, edit
   const [editReg, setEditReg] = useState(null)
-  const [pdfText, setPdfText] = useState('')
-  const [parsing, setParsing] = useState(false)
   const [saving, setSaving] = useState(false)
   const [toast, setToast] = useState('')
   const [form, setForm] = useState({ source: 'LCGPA', title: '', category: 'General', subcategory: '', document_name: '', article_numbers: '', content: '', summary: '', effective_date: '' })
-  const fileRef = useRef(null)
 
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(''), 3000) }
   const s = (k, v) => setForm(p => ({ ...p, [k]: v }))
-
-  const getAuthHeader = async () => {
-    if (!supabase) return {}
-    const { data: { session } } = await supabase.auth.getSession()
-    return session ? { Authorization: `Bearer ${session.access_token}` } : {}
-  }
 
   // Load regulations
   useEffect(() => {
@@ -594,94 +609,6 @@ function RegulationsAdmin({ user, mobile }) {
     })()
   }, [])
 
-  // Upload and parse PDF — renders pages as images, sends to Claude Vision
-  const [parseProgress, setParseProgress] = useState('')
-  const handlePdfUpload = async (e) => {
-    const file = e.target.files?.[0]
-    if (!file || !file.name.endsWith('.pdf')) { showToast('Please select a PDF file'); return }
-    if (file.size > 20 * 1024 * 1024) { showToast('File too large (max 20MB)'); return }
-
-    setParsing(true)
-    setParseProgress('Loading PDF...')
-    try {
-      // Load PDF.js for rendering pages as images
-      if (!window.pdfjsLib) {
-        await new Promise((resolve, reject) => {
-          const script = document.createElement('script')
-          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
-          script.onload = resolve
-          script.onerror = reject
-          document.head.appendChild(script)
-        })
-        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
-      }
-
-      // Read file
-      const arrayBuffer = await new Promise((resolve, reject) => {
-        const reader = new FileReader()
-        reader.onload = () => resolve(reader.result)
-        reader.onerror = reject
-        reader.readAsArrayBuffer(file)
-      })
-
-      // Open PDF and render each page as image
-      const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise
-      const pageImages = []
-      setParseProgress(`Rendering ${pdf.numPages} pages...`)
-
-      for (let i = 1; i <= pdf.numPages; i++) {
-        setParseProgress(`Rendering page ${i} of ${pdf.numPages}...`)
-        const page = await pdf.getPage(i)
-        const scale = 2.0 // high res for better OCR
-        const viewport = page.getViewport({ scale })
-        const canvas = document.createElement('canvas')
-        canvas.width = viewport.width
-        canvas.height = viewport.height
-        const ctx = canvas.getContext('2d')
-        await page.render({ canvasContext: ctx, viewport }).promise
-        // Convert to PNG base64 (strip the data:image/png;base64, prefix)
-        const dataUrl = canvas.toDataURL('image/png', 0.85)
-        pageImages.push(dataUrl.split(',')[1])
-      }
-
-      setParseProgress(`Reading text with AI (${pdf.numPages} pages)... This may take 30-60 seconds.`)
-
-      // Send page images to server for Claude Vision OCR
-      const headers = await getAuthHeader()
-      const res = await fetch('/api/parse-pdf', {
-        method: 'POST',
-        headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pageImages, fileName: file.name, totalPages: pdf.numPages }),
-      })
-
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        // If partial text was extracted, use it
-        if (err.partialText) {
-          setPdfText(err.partialText)
-          s('content', err.partialText)
-          showToast(`Partial extraction: ${err.error}`)
-        } else {
-          showToast(err.error || 'Failed to read PDF.')
-        }
-        setParsing(false)
-        setParseProgress('')
-        return
-      }
-
-      const data = await res.json()
-      setPdfText(data.text)
-      s('content', data.text)
-      s('document_name', file.name.replace('.pdf', ''))
-      showToast(`Extracted ${data.pages} pages from ${file.name}`)
-    } catch (err) {
-      showToast('Failed to parse PDF. Try copy-pasting the text instead.')
-    }
-    setParsing(false)
-    setParseProgress('')
-    if (fileRef.current) fileRef.current.value = ''
-  }
-
   // Save regulation
   const handleSave = async () => {
     if (!form.title || !form.content || !form.category) { showToast('Title, category, and content are required'); return }
@@ -691,15 +618,11 @@ function RegulationsAdmin({ user, mobile }) {
       const method = editReg ? 'PUT' : 'POST'
       const body = editReg ? { id: editReg.id, ...form } : form
 
-      console.log('Saving regulation:', { method, title: form.title, hasAuth: !!headers.Authorization })
-
       const res = await fetch('/api/regulations', {
         method,
         headers: { ...headers, 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-
-      console.log('Save response status:', res.status)
 
       if (res.ok) {
         const data = await res.json()
@@ -713,11 +636,9 @@ function RegulationsAdmin({ user, mobile }) {
       } else {
         let errMsg = `Save failed (${res.status})`
         try { const err = await res.json(); errMsg = err.error || errMsg } catch {}
-        console.error('Save failed:', errMsg)
         showToast(errMsg)
       }
     } catch (e) {
-      console.error('Save error:', e)
       showToast('Failed to save: ' + (e.message || 'Unknown error'))
     }
     setSaving(false)
@@ -740,7 +661,6 @@ function RegulationsAdmin({ user, mobile }) {
 
   const resetForm = () => {
     setForm({ source: 'LCGPA', title: '', category: 'General', subcategory: '', document_name: '', article_numbers: '', content: '', summary: '', effective_date: '' })
-    setPdfText('')
     setEditReg(null)
     setMode('list')
   }
@@ -763,7 +683,7 @@ function RegulationsAdmin({ user, mobile }) {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 24, flexWrap: 'wrap', gap: 12 }}>
         <div>
           <h1 style={{ fontSize: mobile ? 22 : 28, fontWeight: 800, letterSpacing: '-0.02em', color: T.text, marginBottom: 4 }}>Regulations Knowledge Base</h1>
-          <p style={{ fontSize: 13, color: T.muted }}>{regs.length} regulations loaded. Upload LCGPA/EXPRO PDFs to power the AI advisor.</p>
+          <p style={{ fontSize: 13, color: T.muted }}>{regs.length} regulations loaded. Paste LCGPA/EXPRO regulation text to power the AI advisor.</p>
         </div>
         {mode === 'list' && <button onClick={() => setMode('add')} style={{ ...btnP, padding: '10px 20px', fontSize: 13 }}>+ Add Regulation</button>}
       </div>
@@ -778,21 +698,10 @@ function RegulationsAdmin({ user, mobile }) {
             <button onClick={resetForm} style={{ background: 'none', border: 'none', color: T.muted, cursor: 'pointer', fontSize: 14 }}>← Back to list</button>
           </div>
 
-          {/* PDF Upload */}
-          <div style={{ padding: 20, border: `2px dashed ${T.border}`, borderRadius: 12, textAlign: 'center', marginBottom: 20, background: T.bgInput, cursor: 'pointer' }} onClick={() => fileRef.current?.click()}>
-            <input ref={fileRef} type="file" accept=".pdf" onChange={handlePdfUpload} style={{ display: 'none' }} />
-            {parsing ? (
-              <div style={{ color: T.accent, fontSize: 14 }}>
-                <div style={{ marginBottom: 4 }}>{parseProgress || 'Processing...'}</div>
-                <div style={{ fontSize: 11, color: T.muted }}>Handles scanned documents and Arabic text.</div>
-              </div>
-            ) : (
-              <>
-                <div style={{ fontSize: 32, marginBottom: 8 }}>📄</div>
-                <div style={{ fontSize: 14, fontWeight: 600, color: T.text, marginBottom: 4 }}>Click to upload a PDF</div>
-                <div style={{ fontSize: 12, color: T.muted }}>The text will be extracted automatically. Max 10MB.</div>
-              </>
-            )}
+          {/* Help text — replaces the removed PDF upload UI */}
+          <div style={{ padding: 14, border: `1px solid ${T.border}`, borderRadius: 10, marginBottom: 20, background: T.bgInput }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: T.text, marginBottom: 4 }}>How to add a regulation</div>
+            <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.6 }}>Paste the regulation text into the <b>Content</b> field below. For PDFs (especially scanned or Arabic documents), extract the text using Gemini or another tool first, then paste the clean text here.</div>
           </div>
 
           {/* Form fields */}
@@ -838,7 +747,7 @@ function RegulationsAdmin({ user, mobile }) {
               <label style={{ ...labelStyle, marginBottom: 0 }}>Content</label>
               <span style={{ fontSize: 11, color: T.dim }}>{form.content.length.toLocaleString()} chars</span>
             </div>
-            <textarea value={form.content} onChange={e => s('content', e.target.value)} rows={12} placeholder="Paste or upload regulation text here..." style={{ ...inputStyle, resize: 'vertical', fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, lineHeight: 1.6 }} />
+            <textarea value={form.content} onChange={e => s('content', e.target.value)} rows={16} placeholder="Paste regulation text here..." style={{ ...inputStyle, resize: 'vertical', fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, lineHeight: 1.6 }} />
           </div>
 
           <div style={{ display: 'flex', gap: 12 }}>
@@ -857,8 +766,8 @@ function RegulationsAdmin({ user, mobile }) {
             <div style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 16, padding: 48, textAlign: 'center' }}>
               <div style={{ fontSize: 48, marginBottom: 16 }}>📂</div>
               <p style={{ fontSize: 16, fontWeight: 600, color: T.text, marginBottom: 8 }}>No regulations uploaded yet</p>
-              <p style={{ fontSize: 13, color: T.muted, marginBottom: 20 }}>Upload LCGPA and EXPRO PDFs to give the AI Advisor authoritative knowledge.</p>
-              <button onClick={() => setMode('add')} style={{ ...btnP, padding: '10px 24px', fontSize: 13 }}>Upload First Regulation</button>
+              <p style={{ fontSize: 13, color: T.muted, marginBottom: 20 }}>Paste LCGPA and EXPRO regulation text to give the AI Advisor authoritative knowledge.</p>
+              <button onClick={() => setMode('add')} style={{ ...btnP, padding: '10px 24px', fontSize: 13 }}>Add First Regulation</button>
             </div>
           ) : (
             <>

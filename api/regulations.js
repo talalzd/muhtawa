@@ -10,6 +10,23 @@ function isAdmin(email) {
   return ADMIN_EMAILS.includes(email.toLowerCase())
 }
 
+// ─── CORS ──────────────────────────────────────────────────────────────
+// Restrict to ALLOWED_ORIGINS (comma-separated). If unset, echoes the
+// request origin — set the env var in production to lock it down.
+function setCORS(req, res) {
+  const allowed = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+  const origin = req.headers.origin
+  if (origin && (allowed.length === 0 || allowed.includes(origin))) {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    res.setHeader('Vary', 'Origin')
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+}
+
 function getSupabase() {
   const url = process.env.VITE_SUPABASE_URL
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY
@@ -31,9 +48,7 @@ async function getUser(req, supabase) {
 }
 
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*')
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+  setCORS(req, res)
 
   if (req.method === 'OPTIONS') return res.status(200).end()
 

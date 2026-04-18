@@ -1,34 +1,90 @@
 // /api/chat.js — Vercel Serverless Function
-// Proxies requests to Claude API with server-side API key
-// Pulls relevant regulations from Supabase for RAG context
+// Proxies requests to Claude API with server-side API key.
+// Requires authenticated Supabase user. Rate limited per user via Supabase.
 
 import { createClient } from '@supabase/supabase-js'
 
-const rateLimits = new Map()
-const RATE_LIMIT = 20
-const RATE_WINDOW = 60 * 1000
+const RATE_LIMIT = 20           // messages per window per user
+const RATE_WINDOW_MS = 60 * 1000 // 1 minute
 
-function checkRateLimit(ip) {
-  const now = Date.now()
-  const entry = rateLimits.get(ip)
-  if (!entry || now - entry.start > RATE_WINDOW) {
-    rateLimits.set(ip, { start: now, count: 1 })
-    return true
+// ─── CORS ──────────────────────────────────────────────────────────────
+// Restrict to ALLOWED_ORIGINS (comma-separated). If unset, echoes the
+// request origin (permissive like the old behaviour) — set the env var
+// in production to lock it down.
+function setCORS(req, res) {
+  const allowed = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+  const origin = req.headers.origin
+  if (origin && (allowed.length === 0 || allowed.includes(origin))) {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    res.setHeader('Vary', 'Origin')
   }
-  if (entry.count >= RATE_LIMIT) return false
-  entry.count++
-  return true
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
 }
 
-// Fetch ALL regulations — with only 5-15 documents, load everything
-// Claude can read through all of them and find the right answer
-async function getAllRegulations() {
-  const supabaseUrl = process.env.VITE_SUPABASE_URL
-  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY
-  if (!supabaseUrl || !supabaseKey) return []
+function getSupabase() {
+  const url = process.env.VITE_SUPABASE_URL
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY
+  if (!url || !key) return null
+  return createClient(url, key)
+}
 
-  const supabase = createClient(supabaseUrl, supabaseKey)
+async function getUser(req, supabase) {
+  try {
+    const auth = req.headers.authorization
+    if (!auth) return null
+    const token = auth.replace('Bearer ', '')
+    const { data: { user }, error } = await supabase.auth.getUser(token)
+    if (error) return null
+    return user
+  } catch {
+    return null
+  }
+}
 
+// Supabase-backed per-user rate limit. Fails open if the table is missing
+// (auth is still the primary gate). Requires the api_rate_limits table —
+// see README_security_updates.md for the migration SQL.
+async function checkRateLimit(supabase, userId) {
+  const now = Date.now()
+  const windowStart = new Date(now - RATE_WINDOW_MS).toISOString()
+
+  try {
+    const { count, error } = await supabase
+      .from('api_rate_limits')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .eq('endpoint', 'chat')
+      .gte('ts', windowStart)
+
+    if (error) {
+      // Table probably missing — log and fail open so users aren't blocked
+      // by a missing migration. Auth check above still applies.
+      console.warn('Rate limit check failed (table missing?):', error.message)
+      return true
+    }
+
+    if ((count || 0) >= RATE_LIMIT) return false
+
+    // Record this request
+    await supabase.from('api_rate_limits').insert({ user_id: userId, endpoint: 'chat' })
+
+    // Opportunistic cleanup of entries older than 1 hour (fire and forget)
+    const cleanupBefore = new Date(now - 3600000).toISOString()
+    supabase.from('api_rate_limits').delete().lt('ts', cleanupBefore)
+      .then(() => {}).catch(() => {})
+
+    return true
+  } catch (e) {
+    console.warn('Rate limit error:', e?.message)
+    return true
+  }
+}
+
+async function getAllRegulations(supabase) {
   const { data, error } = await supabase
     .from('regulations')
     .select('source, title, category, document_name, article_numbers, content, summary')
@@ -40,22 +96,28 @@ async function getAllRegulations() {
 }
 
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*')
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+  setCORS(req, res)
 
   if (req.method === 'OPTIONS') return res.status(200).end()
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
-  const ip = req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || 'unknown'
-  if (!checkRateLimit(ip)) {
-    return res.status(429).json({ error: 'Too many requests. Please wait a moment.' })
+  const supabase = getSupabase()
+  if (!supabase) return res.status(500).json({ error: 'Service not configured.' })
+
+  // Require authenticated user
+  const user = await getUser(req, supabase)
+  if (!user) return res.status(401).json({ error: 'Please sign in to use the AI advisor.' })
+
+  // Per-user rate limit
+  const allowed = await checkRateLimit(supabase, user.id)
+  if (!allowed) {
+    return res.status(429).json({
+      error: `Rate limit reached (${RATE_LIMIT} messages/minute). Please wait a moment.`,
+    })
   }
 
   const apiKey = process.env.ANTHROPIC_API_KEY
-  if (!apiKey) {
-    return res.status(500).json({ error: 'AI service not configured.' })
-  }
+  if (!apiKey) return res.status(500).json({ error: 'AI service not configured.' })
 
   const { system, messages } = req.body || {}
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
@@ -68,10 +130,8 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Load ALL regulations — only 5-15 docs, Claude reads through all of them
-    const regulations = await getAllRegulations()
+    const regulations = await getAllRegulations(supabase)
 
-    // Build enhanced system prompt with full regulation context
     let enhancedSystem = system || ''
 
     if (regulations.length > 0) {
