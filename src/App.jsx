@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { supabase, signUp, signIn, signOut, getSession, saveCompany, getCompany, saveAssessment, getAssessments, submitFeedback } from './lib/supabase.js'
 import { SECTORS, PRODUCT_CATEGORIES, LC_THRESHOLD, ASSET_TYPES, TEMPLATE_VERSION } from './lib/sectors.js'
 import { computeScore, getRecommendations, fmt, pct, TOOLTIPS } from './lib/scoring.js'
+import { SAMPLE_CASES, SAMPLE_SECTORS, SAMPLE_STORIES } from './lib/samples.js'
 import { exportAssessmentPDF } from './lib/pdf.js'
 
 // ─── THEME ─────────────────────────────────────────────────────────────
@@ -83,7 +84,7 @@ const TEAM_QUESTIONS = [
 ]
 
 function emptyAssessment() {
-  return { id: Date.now(), date: new Date().toISOString(), labor: { saudiComp: 0, foreignComp: 0 }, suppliers: [], training: 0, supplierDev: 0, rdExpense: 0, totalRevenue: 0, assets: [], totalGSExpense: 0, otherCosts: 0, inventoryMovement: 0 }
+  return { id: Date.now(), name: '', date: new Date().toISOString(), labor: { saudiComp: 0, foreignComp: 0 }, suppliers: [], training: 0, supplierDev: 0, rdExpense: 0, totalRevenue: 0, assets: [], totalGSExpense: 0, otherCosts: 0, inventoryMovement: 0 }
 }
 
 // ─── #13: RESPONSIVE HOOK ──────────────────────────────────────────────
@@ -127,6 +128,21 @@ export default function App() {
     })()
   }, [])
 
+  // Listen for Supabase auth events so we can detect the password-recovery
+  // flow (user clicked the reset-email link) and send them to the
+  // "set new password" screen.
+  useEffect(() => {
+    if (!supabase) return
+    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'PASSWORD_RECOVERY' && session?.user) {
+        setUser(session.user)
+        setView('reset-password')
+        setLoading(false)
+      }
+    })
+    return () => sub?.subscription?.unsubscribe?.()
+  }, [])
+
   // #13: close sidebar on mobile when navigating
   useEffect(() => { if (mobile) setSbOpen(false) }, [view, mobile])
 
@@ -135,7 +151,13 @@ export default function App() {
     try {
       const { data, error } = isNew ? await signUp(email, password) : await signIn(email, password)
       if (error) return { error: { message: sanitizeError(error.message) } }
-      if (data?.user) {
+      // On signup, Supabase may require email verification. In that case
+      // data.user exists but data.session is null — we should NOT log the
+      // user in, instead tell them to check their email.
+      if (isNew && data?.user && !data?.session) {
+        return { error: null, needsVerification: true }
+      }
+      if (data?.user && data?.session) {
         setUser(data.user)
         try { const { data: c } = await getCompany(data.user.id); if (c) setCompany(c) } catch {}
         try { const { data: list } = await getAssessments(data.user.id); if (list) setAssessments(list.map(r => ({ ...r.assessment_data, db_id: r.id }))) } catch {}
@@ -167,6 +189,57 @@ export default function App() {
     setCurA(a)
   }
 
+  // Delete an assessment both in the database and in local state.
+  // If there's no db_id (legacy / never saved), just drop it locally.
+  async function handleDeleteAssessment(a) {
+    if (!a) return
+    try {
+      if (a.db_id && supabase) {
+        await supabase.from('assessments').delete().eq('id', a.db_id)
+      }
+    } catch {
+      showToast('Delete failed — please try again', 'error')
+      return
+    }
+    setAssessments(prev => prev.filter(x => x.id !== a.id))
+    if (curA?.id === a.id) setCurA(null)
+    showToast('Assessment removed')
+  }
+
+  // Send a password reset email. Supabase mails a link back to the app;
+  // when the user clicks it, our onAuthStateChange listener catches the
+  // PASSWORD_RECOVERY event and routes them to the reset screen.
+  async function handleRequestPasswordReset(email) {
+    if (!supabase) return { error: { message: 'Password reset is not available in demo mode.' } }
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: window.location.origin,
+      })
+      if (error) return { error: { message: sanitizeError(error.message) } }
+      return { error: null }
+    } catch (e) {
+      return { error: { message: sanitizeError(e) } }
+    }
+  }
+
+  // Complete the password reset by setting a new password for the
+  // currently-authenticated (recovery-token) user.
+  async function handleSetNewPassword(newPassword) {
+    if (!supabase) return { error: { message: 'Not available in demo mode.' } }
+    try {
+      const { error } = await supabase.auth.updateUser({ password: newPassword })
+      if (error) return { error: { message: sanitizeError(error.message) } }
+      // Sign the recovery-token session out and send user back to login
+      await signOut()
+      setUser(null); setCompany(null); setAssessments([]); setCurA(null)
+      setView('login')
+      showToast('Password updated — please sign in')
+      return { error: null }
+    } catch (e) {
+      return { error: { message: sanitizeError(e) } }
+    }
+  }
+
   // #4: loading state for PDF export
   function handleExport(a) {
     showToast('Generating PDF...', 'success')
@@ -177,7 +250,8 @@ export default function App() {
 
   if (loading) return <div style={{ minHeight: '100vh', background: T.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 16 }}><div style={{ width: 48, height: 48, background: `linear-gradient(135deg, ${T.accent}, ${T.accentDim})`, borderRadius: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: 24, color: '#fff' }}>م</div><div style={{ color: T.muted }}>Loading...</div></div>
   if (view === 'landing') return <Landing onStart={() => setView('login')} />
-  if (view === 'login') return <Auth onAuth={handleAuth} onBack={() => setView('landing')} />
+  if (view === 'login') return <Auth onAuth={handleAuth} onBack={() => setView('landing')} onRequestReset={handleRequestPasswordReset} />
+  if (view === 'reset-password') return <ResetPassword onSubmit={handleSetNewPassword} />
   if (view === 'company-setup') return <CompanySetup onSave={handleSaveCompany} existing={company} mobile={mobile} />
 
   const sidebarWidth = mobile ? 0 : (sbOpen ? 260 : 64)
@@ -188,7 +262,8 @@ export default function App() {
       {mobile && <div onClick={() => setSbOpen(!sbOpen)} style={{ position: 'fixed', top: 12, left: 12, zIndex: 200, width: 40, height: 40, background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', fontSize: 20 }}>☰</div>}
       {(!mobile || sbOpen) && <><Sidebar view={view} setView={setView} user={user} open={mobile ? true : sbOpen} toggle={() => setSbOpen(!sbOpen)} onLogout={handleLogout} mobile={mobile} />{mobile && sbOpen && <div onClick={() => setSbOpen(false)} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 99 }} />}</>}
       <main style={{ flex: 1, marginLeft: sidebarWidth, transition: 'margin-left 0.3s ease', padding: mobile ? '60px 16px 16px' : '32px 40px' }}>
-        {view === 'dashboard' && <Dashboard company={company} assessments={assessments} onNew={() => { setCurA(emptyAssessment()); setView('calculator') }} onSetup={() => setView('company-setup')} onView={a => { setCurA(a); setView('calculator') }} onAdvisor={() => setView('advisor')} onExport={handleExport} mobile={mobile} />}
+        {view === 'dashboard' && <Dashboard company={company} assessments={assessments} onNew={() => setView('new-assessment')} onSetup={() => setView('company-setup')} onView={a => { setCurA(a); setView('calculator') }} onDelete={handleDeleteAssessment} onAdvisor={() => setView('advisor')} onExport={handleExport} mobile={mobile} />}
+        {view === 'new-assessment' && <SamplePicker mobile={mobile} onBlank={() => { setCurA(emptyAssessment()); setView('calculator') }} onSample={(caseId, sectorId) => { const c = SAMPLE_CASES.find(x => x.id === caseId); if (!c) return; const a = { id: Date.now(), date: new Date().toISOString(), ...c.build(sectorId) }; setCurA(a); setView('calculator') }} onBack={() => setView('dashboard')} />}
         {view === 'calculator' && <Calculator assessment={curA || emptyAssessment()} onSave={handleSaveAssessment} company={company} onExport={handleExport} mobile={mobile} />}
         {view === 'made-in-saudi' && <MadeInSaudi mobile={mobile} />}
         {view === 'advisor' && <Advisor company={company} currentAssessment={curA} mobile={mobile} />}
@@ -264,28 +339,84 @@ function Landing({ onStart }) {
   )
 }
 
-// ═══ AUTH (#5: reviewed, #9: rate limited, #10: sanitized) ═══
-function Auth({ onAuth, onBack }) {
-  const [isNew, setIsNew] = useState(false)
+// ═══ AUTH (#5 reviewed, #9 rate limited, #10 sanitized, forgot-password + email verification) ═══
+function Auth({ onAuth, onBack, onRequestReset }) {
+  // mode: 'signin' | 'signup' | 'forgot' | 'verifySent' | 'resetSent'
+  const [mode, setMode] = useState('signin')
   const [email, setEmail] = useState('')
   const [pw, setPw] = useState('')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
   const checkRate = useRateLimit(5, 60000) // #9: 5 attempts per minute
 
+  const isNew = mode === 'signup'
+
   const go = async () => {
     if (busy) return
-    // #9: rate limit check
     if (!checkRate()) { setErr('Too many attempts. Please wait a moment.'); return }
-    // #5: validate before sending
     const valErr = validateAuth(email, pw, isNew)
     if (valErr) { setErr(valErr); return }
     setBusy(true); setErr('')
-    const { error } = await onAuth(email, pw, isNew)
+    const { error, needsVerification } = await onAuth(email, pw, isNew)
     if (error) setErr(error.message)
+    else if (needsVerification) setMode('verifySent')
     setBusy(false)
   }
 
+  const sendReset = async () => {
+    if (busy) return
+    if (!checkRate()) { setErr('Too many attempts. Please wait a moment.'); return }
+    if (!email || !email.includes('@') || !email.includes('.')) { setErr('Please enter a valid email address.'); return }
+    setBusy(true); setErr('')
+    const { error } = await onRequestReset(email)
+    if (error) setErr(error.message)
+    else setMode('resetSent')
+    setBusy(false)
+  }
+
+  // ── "Check your email" screens (post-signup or post-reset-request) ──
+  if (mode === 'verifySent' || mode === 'resetSent') {
+    const isVerify = mode === 'verifySent'
+    return (
+      <div style={{ minHeight: '100vh', background: T.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+        <div className="fade-in" style={{ width: '100%', maxWidth: 420, padding: '32px 28px', background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 20, textAlign: 'center' }}>
+          <div style={{ fontSize: 48, marginBottom: 16 }}>📬</div>
+          <h2 style={{ fontSize: 22, fontWeight: 700, color: T.text, marginBottom: 8 }}>Check your email</h2>
+          <p style={{ fontSize: 14, color: T.muted, lineHeight: 1.6, marginBottom: 24 }}>
+            {isVerify
+              ? <>We sent a verification link to <b style={{ color: T.text }}>{email}</b>. Click it to activate your account, then come back here to sign in.</>
+              : <>We sent a password reset link to <b style={{ color: T.text }}>{email}</b>. Click it to set a new password.</>}
+          </p>
+          <p style={{ fontSize: 12, color: T.dim, marginBottom: 24 }}>Didn't receive it? Check your spam folder, or wait a minute and try again.</p>
+          <button onClick={() => { setMode('signin'); setErr('') }} style={{ ...btnP, width: '100%' }}>Back to sign in</button>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Forgot-password screen ──
+  if (mode === 'forgot') {
+    return (
+      <div style={{ minHeight: '100vh', background: T.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+        <div className="fade-in" style={{ width: '100%', maxWidth: 420, padding: '32px 28px', background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 20 }}>
+          <button onClick={() => { setMode('signin'); setErr('') }} style={{ background: 'none', border: 'none', color: T.muted, fontSize: 14, cursor: 'pointer', marginBottom: 24, padding: 0 }}>← Back to sign in</button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 32 }}>
+            <div style={{ width: 32, height: 32, background: `linear-gradient(135deg, ${T.accent}, ${T.accentDim})`, borderRadius: 7, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: 16, color: '#fff' }}>م</div>
+            <span style={{ fontSize: 20, fontWeight: 700, color: T.text }}>Muhtawa</span>
+          </div>
+          <h2 style={{ fontSize: 24, fontWeight: 700, color: T.text, marginBottom: 8 }}>Reset your password</h2>
+          <p style={{ fontSize: 14, color: T.muted, marginBottom: 28 }}>Enter your email and we'll send you a link to set a new password.</p>
+          {err && <div style={{ padding: '10px 14px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, color: T.danger, fontSize: 13, marginBottom: 16 }}>{err}</div>}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <div><label style={labelStyle}>Email</label><input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@company.com" style={inputStyle} onKeyDown={e => e.key === 'Enter' && sendReset()} autoComplete="email" /></div>
+            <button onClick={sendReset} disabled={busy} style={{ ...btnP, width: '100%', opacity: busy ? 0.7 : 1, cursor: busy ? 'wait' : 'pointer' }}>{busy ? 'Sending...' : 'Send reset link'}</button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Default: sign in / sign up ──
   return (
     <div style={{ minHeight: '100vh', background: T.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px' }}>
       <div className="fade-in" style={{ width: '100%', maxWidth: 420, padding: '32px 28px', background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 20 }}>
@@ -300,10 +431,55 @@ function Auth({ onAuth, onBack }) {
         {!supabase && <div style={{ padding: '10px 14px', background: T.glow, border: '1px solid rgba(16,185,129,0.2)', borderRadius: 8, color: T.accent, fontSize: 13, marginBottom: 16 }}>Demo mode — enter any email and password to explore.</div>}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <div><label style={labelStyle}>Email</label><input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@company.com" style={inputStyle} onKeyDown={e => e.key === 'Enter' && go()} autoComplete="email" /></div>
-          <div><label style={labelStyle}>Password</label><input type="password" value={pw} onChange={e => setPw(e.target.value)} placeholder={isNew ? 'Min 8 characters' : '••••••••'} style={inputStyle} onKeyDown={e => e.key === 'Enter' && go()} autoComplete={isNew ? 'new-password' : 'current-password'} /></div>
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+              <label style={labelStyle}>Password</label>
+              {!isNew && <span onClick={() => { setMode('forgot'); setErr('') }} style={{ fontSize: 12, color: T.accent, cursor: 'pointer', fontWeight: 600 }}>Forgot password?</span>}
+            </div>
+            <input type="password" value={pw} onChange={e => setPw(e.target.value)} placeholder={isNew ? 'Min 8 characters' : '••••••••'} style={inputStyle} onKeyDown={e => e.key === 'Enter' && go()} autoComplete={isNew ? 'new-password' : 'current-password'} />
+          </div>
           <button onClick={go} disabled={busy} style={{ ...btnP, width: '100%', opacity: busy ? 0.7 : 1, cursor: busy ? 'wait' : 'pointer' }}>{busy ? 'Please wait...' : isNew ? 'Create Account' : 'Sign In'}</button>
         </div>
-        <p style={{ textAlign: 'center', fontSize: 14, color: T.muted, marginTop: 24 }}>{isNew ? 'Already have an account?' : "Don't have an account?"} <span onClick={() => { setIsNew(!isNew); setErr('') }} style={{ color: T.accent, cursor: 'pointer', fontWeight: 600 }}>{isNew ? 'Sign in' : 'Sign up'}</span></p>
+        <p style={{ textAlign: 'center', fontSize: 14, color: T.muted, marginTop: 24 }}>{isNew ? 'Already have an account?' : "Don't have an account?"} <span onClick={() => { setMode(isNew ? 'signin' : 'signup'); setErr('') }} style={{ color: T.accent, cursor: 'pointer', fontWeight: 600 }}>{isNew ? 'Sign in' : 'Sign up'}</span></p>
+      </div>
+    </div>
+  )
+}
+
+// ═══ RESET PASSWORD ═══
+// Shown after the user clicks the reset link in the email (supabase fires
+// a PASSWORD_RECOVERY auth event which routes them here).
+function ResetPassword({ onSubmit }) {
+  const [pw, setPw] = useState('')
+  const [pw2, setPw2] = useState('')
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const go = async () => {
+    if (busy) return
+    if (!pw || pw.length < 8) { setErr('Password must be at least 8 characters.'); return }
+    if (pw !== pw2) { setErr('Passwords do not match.'); return }
+    setBusy(true); setErr('')
+    const { error } = await onSubmit(pw)
+    if (error) { setErr(error.message); setBusy(false) }
+    // on success, parent redirects us — no need to reset busy state
+  }
+
+  return (
+    <div style={{ minHeight: '100vh', background: T.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+      <div className="fade-in" style={{ width: '100%', maxWidth: 420, padding: '32px 28px', background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 20 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 32 }}>
+          <div style={{ width: 32, height: 32, background: `linear-gradient(135deg, ${T.accent}, ${T.accentDim})`, borderRadius: 7, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: 16, color: '#fff' }}>م</div>
+          <span style={{ fontSize: 20, fontWeight: 700, color: T.text }}>Muhtawa</span>
+        </div>
+        <h2 style={{ fontSize: 24, fontWeight: 700, color: T.text, marginBottom: 8 }}>Set a new password</h2>
+        <p style={{ fontSize: 14, color: T.muted, marginBottom: 28 }}>Pick a strong password for your Muhtawa account.</p>
+        {err && <div style={{ padding: '10px 14px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, color: T.danger, fontSize: 13, marginBottom: 16 }}>{err}</div>}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          <div><label style={labelStyle}>New password</label><input type="password" value={pw} onChange={e => setPw(e.target.value)} placeholder="Min 8 characters" style={inputStyle} onKeyDown={e => e.key === 'Enter' && go()} autoComplete="new-password" /></div>
+          <div><label style={labelStyle}>Confirm password</label><input type="password" value={pw2} onChange={e => setPw2(e.target.value)} placeholder="Re-enter password" style={inputStyle} onKeyDown={e => e.key === 'Enter' && go()} autoComplete="new-password" /></div>
+          <button onClick={go} disabled={busy} style={{ ...btnP, width: '100%', opacity: busy ? 0.7 : 1, cursor: busy ? 'wait' : 'pointer' }}>{busy ? 'Updating...' : 'Update password'}</button>
+        </div>
       </div>
     </div>
   )
@@ -339,9 +515,11 @@ function Sidebar({ view, setView, user, open, toggle, onLogout, mobile }) {
 }
 
 // ═══ DASHBOARD ═══
-function Dashboard({ company, assessments, onNew, onSetup, onView, onAdvisor, onExport, mobile }) {
+function Dashboard({ company, assessments, onNew, onSetup, onView, onDelete, onAdvisor, onExport, mobile }) {
   const latest = assessments[assessments.length - 1]
   const ls = latest ? computeScore(latest) : null
+  // Friendly label for an assessment — use name if provided, fall back to date
+  const labelFor = (a) => (a.name && a.name.trim()) || new Date(a.date).toLocaleDateString('en-SA', { month: 'short', day: 'numeric', year: 'numeric' })
   return (
     <div className="fade-in">
       <div style={{ marginBottom: 24 }}><h1 style={{ fontSize: mobile ? 22 : 28, fontWeight: 800, letterSpacing: '-0.02em', color: T.text, marginBottom: 4 }}>Dashboard</h1><p style={{ fontSize: 14, color: T.muted }}>{company ? `${company.name}` : 'Set up your company to get started'}</p></div>
@@ -350,15 +528,22 @@ function Dashboard({ company, assessments, onNew, onSetup, onView, onAdvisor, on
         <SC label="LC Score" value={ls ? pct(ls.totalScore) : '—'} sub={ls ? (ls.meetsThreshold ? 'Above' : `${pct(ls.gap)} below`) : 'N/A'} color={ls ? (ls.meetsThreshold ? T.success : T.danger) : T.dim} />
         <SC label="Assessments" value={assessments.length} sub="Total" color={T.accent} />
         <SC label="Threshold" value={pct(LC_THRESHOLD)} sub="Minimum" color={T.warning} />
-        <SC label="Sectors" value="39" sub="Categories" color={T.accent} />
+        <SC label="Sectors" value={SECTORS.length} sub="Categories" color={T.accent} />
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '2fr 1fr', gap: 24 }}>
         <div style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 16, padding: mobile ? 16 : 28 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}><h2 style={{ fontSize: 18, fontWeight: 700, color: T.text }}>Assessments</h2><button onClick={onNew} style={{ ...btnP, padding: '8px 16px', fontSize: 13 }}>+ New</button></div>
-          {assessments.length === 0 ? <div style={{ textAlign: 'center', padding: '48px 0', color: T.dim }}><p style={{ fontSize: 15, marginBottom: 8 }}>No assessments yet</p></div> : assessments.slice().reverse().map(a => { const s = computeScore(a); return (
+          {assessments.length === 0 ? <div style={{ textAlign: 'center', padding: '48px 0', color: T.dim }}><p style={{ fontSize: 15, marginBottom: 8 }}>No assessments yet</p></div> : assessments.slice().reverse().map(a => { const s = computeScore(a); const hasName = !!(a.name && a.name.trim()); return (
             <div key={a.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 14px', borderRadius: 10, marginBottom: 6, border: `1px solid ${T.border}`, cursor: 'pointer' }} onMouseEnter={e => { e.currentTarget.style.borderColor = T.accentDim; e.currentTarget.style.background = T.bgHover }} onMouseLeave={e => { e.currentTarget.style.borderColor = T.border; e.currentTarget.style.background = 'transparent' }}>
-              <div onClick={() => onView(a)} style={{ flex: 1 }}><div style={{ fontSize: 14, fontWeight: 600, color: T.text }}>{new Date(a.date).toLocaleDateString('en-SA', { month: 'short', day: 'numeric', year: 'numeric' })}</div><div style={{ fontSize: 12, color: T.dim }}>LC: {pct(s.totalScore)}</div></div>
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}><button onClick={e => { e.stopPropagation(); onExport(a) }} style={{ padding: '4px 8px', background: 'transparent', border: `1px solid ${T.border}`, borderRadius: 6, color: T.muted, fontSize: 11, cursor: 'pointer' }}>PDF</button><div style={{ padding: '4px 10px', borderRadius: 6, fontSize: 12, fontWeight: 700, background: s.meetsThreshold ? 'rgba(16,185,129,0.15)' : 'rgba(239,68,68,0.15)', color: s.meetsThreshold ? T.success : T.danger }}>{s.meetsThreshold ? 'PASS' : 'BELOW'}</div></div>
+              <div onClick={() => onView(a)} style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 14, fontWeight: 600, color: T.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{labelFor(a)}</div>
+                <div style={{ fontSize: 12, color: T.dim }}>{hasName && <span>{new Date(a.date).toLocaleDateString('en-SA', { month: 'short', day: 'numeric' })} • </span>}LC: {pct(s.totalScore)}</div>
+              </div>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <button onClick={e => { e.stopPropagation(); onExport(a) }} style={{ padding: '4px 8px', background: 'transparent', border: `1px solid ${T.border}`, borderRadius: 6, color: T.muted, fontSize: 11, cursor: 'pointer' }}>PDF</button>
+                <button onClick={e => { e.stopPropagation(); if (confirm(`Remove "${labelFor(a)}"? This cannot be undone.`)) onDelete(a) }} style={{ padding: '4px 8px', background: 'transparent', border: `1px solid rgba(239,68,68,0.3)`, borderRadius: 6, color: T.danger, fontSize: 11, cursor: 'pointer' }} title="Delete assessment">✕</button>
+                <div style={{ padding: '4px 10px', borderRadius: 6, fontSize: 12, fontWeight: 700, background: s.meetsThreshold ? 'rgba(16,185,129,0.15)' : 'rgba(239,68,68,0.15)', color: s.meetsThreshold ? T.success : T.danger }}>{s.meetsThreshold ? 'PASS' : 'BELOW'}</div>
+              </div>
             </div>) })}
         </div>
         <div style={{ display: 'flex', flexDirection: mobile ? 'row' : 'column', gap: 16, flexWrap: 'wrap' }}>
@@ -371,6 +556,74 @@ function Dashboard({ company, assessments, onNew, onSetup, onView, onAdvisor, on
 }
 function SC({ label, value, sub, color }) { return <div style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 14, padding: '16px 14px' }}><div style={{ fontSize: 11, fontWeight: 600, color: T.muted, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.04em' }}>{label}</div><div style={{ fontSize: 24, fontWeight: 800, color, letterSpacing: '-0.02em', marginBottom: 2 }}>{value}</div><div style={{ fontSize: 11, color: T.dim }}>{sub}</div></div> }
 function QA({ icon, title, desc, onClick }) { return <div onClick={onClick} style={{ flex: 1, minWidth: 120, background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 16, padding: 20, cursor: 'pointer', transition: 'border-color 0.3s' }} onMouseEnter={e => e.currentTarget.style.borderColor = T.accentDim} onMouseLeave={e => e.currentTarget.style.borderColor = T.border}><div style={{ fontSize: 24, marginBottom: 8 }}>{icon}</div><h3 style={{ fontSize: 14, fontWeight: 700, color: T.text, marginBottom: 4 }}>{title}</h3><p style={{ fontSize: 12, color: T.muted }}>{desc}</p></div> }
+
+// ═══ SAMPLE PICKER ═══
+// Shown when the user clicks "+ New" on the dashboard. Lets them start
+// with a blank assessment, or load one of three pre-built sample cases
+// (low LC / at threshold / high LC) tailored to their industry.
+function SamplePicker({ mobile, onBlank, onSample, onBack }) {
+  const [selectedSector, setSelectedSector] = useState('generic')
+  const color = { danger: T.danger, warning: T.warning, success: T.success }
+
+  return (
+    <div className="fade-in">
+      <div style={{ marginBottom: 8 }}>
+        <button onClick={onBack} style={{ background: 'none', border: 'none', color: T.muted, fontSize: 14, cursor: 'pointer', marginBottom: 16, padding: 0 }}>← Back to dashboard</button>
+        <h1 style={{ fontSize: mobile ? 22 : 28, fontWeight: 800, letterSpacing: '-0.02em', color: T.text, marginBottom: 4 }}>Start a new assessment</h1>
+        <p style={{ fontSize: 14, color: T.muted }}>Begin with your own data, or try a sample case to see how LC scoring works.</p>
+      </div>
+
+      {/* Option A: blank assessment */}
+      <div onClick={onBlank} style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 14, padding: mobile ? 16 : 20, marginTop: 20, marginBottom: 16, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, transition: 'border-color 0.2s' }}
+        onMouseEnter={e => e.currentTarget.style.borderColor = T.accentDim}
+        onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+        <div>
+          <div style={{ fontSize: 15, fontWeight: 700, color: T.text, marginBottom: 2 }}>Start with a blank assessment</div>
+          <div style={{ fontSize: 13, color: T.muted }}>Enter your own company's data from scratch.</div>
+        </div>
+        <div style={{ color: T.muted, fontSize: 20 }}>→</div>
+      </div>
+
+      {/* Option B: load a sample case */}
+      <div style={{ marginTop: 24, marginBottom: 12 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 700, color: T.text, marginBottom: 4 }}>Or try a sample case</h2>
+        <p style={{ fontSize: 13, color: T.muted }}>See how different companies score and why. Each sample comes with an explanation of what drives its score.</p>
+      </div>
+
+      {/* Sector picker for sample supplier profile */}
+      <div style={{ marginBottom: 16 }}>
+        <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: T.muted, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.03em' }}>Tailor sample to my industry</label>
+        <select value={selectedSector} onChange={e => setSelectedSector(e.target.value)} style={{ ...inputStyle, cursor: 'pointer', maxWidth: mobile ? '100%' : 400 }}>
+          {SAMPLE_SECTORS.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+        </select>
+        <div style={{ fontSize: 11, color: T.dim, marginTop: 6 }}>Changes which suppliers appear in the sample. The final score stays in the same range regardless.</div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : 'repeat(3, 1fr)', gap: 12 }}>
+        {SAMPLE_CASES.map(c => {
+          const c2 = color[c.color] || T.accent
+          return (
+            <div key={c.id} onClick={() => onSample(c.id, selectedSector)} style={{ background: T.bgCard, border: `1px solid ${c2}33`, borderRadius: 14, padding: mobile ? 16 : 20, cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 10, transition: 'border-color 0.2s, transform 0.2s' }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = c2; e.currentTarget.style.transform = 'translateY(-2px)' }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = `${c2}33`; e.currentTarget.style.transform = 'translateY(0)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{ width: 32, height: 32, borderRadius: 8, background: `${c2}22`, color: c2, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16, fontWeight: 800 }}>{c.icon}</div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: T.text }}>{c.title}</div>
+              </div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: c2 }}>{c.subtitle}</div>
+              <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.6, flex: 1 }}>{c.summary}</div>
+              <div style={{ fontSize: 12, fontWeight: 600, color: c2, marginTop: 4 }}>Load this sample →</div>
+            </div>
+          )
+        })}
+      </div>
+
+      <div style={{ marginTop: 24, padding: '12px 16px', background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 10, fontSize: 12, color: T.muted, lineHeight: 1.6 }}>
+        <b style={{ color: T.text }}>Note:</b> Sample cases are illustrative only. The numbers are tuned to demonstrate LC scoring mechanics — not based on any specific real company. You can edit everything after loading.
+      </div>
+    </div>
+  )
+}
 
 // ═══ COMPANY SETUP ═══
 function CompanySetup({ onSave, existing, mobile }) {
@@ -402,12 +655,33 @@ function CompanySetup({ onSave, existing, mobile }) {
 function Calculator({ assessment, onSave, company, onExport, mobile }) {
   const [a, setA] = useState(assessment)
   const [tab, setTab] = useState('labor')
+  const [saveStatus, setSaveStatus] = useState('idle') // 'idle' | 'saving' | 'saved'
   const score = computeScore(a)
   const recs = getRecommendations(score, a)
   const timer = useRef(null)
+  // Track the last snapshot we sent to onSave so we don't re-save on mount
+  // or when the parent re-hands us the same assessment.
+  const lastSaved = useRef(JSON.stringify(assessment))
 
   const upd = (path, val) => { setA(prev => { const n = JSON.parse(JSON.stringify(prev)); const p = path.split('.'); let o = n; for (let i = 0; i < p.length - 1; i++) o = o[p[i]]; o[p[p.length - 1]] = val; return n }) }
-  useEffect(() => { if (timer.current) clearTimeout(timer.current); timer.current = setTimeout(() => onSave(a), 1500); return () => clearTimeout(timer.current) }, [a])
+
+  // Auto-save: 3-second debounce, and only fire if the assessment actually
+  // changed since the last save. Prevents the "save-on-every-keystroke"
+  // pattern that was hammering Supabase.
+  useEffect(() => {
+    const snapshot = JSON.stringify(a)
+    if (snapshot === lastSaved.current) return
+    if (timer.current) clearTimeout(timer.current)
+    setSaveStatus('saving')
+    timer.current = setTimeout(() => {
+      onSave(a)
+      lastSaved.current = snapshot
+      setSaveStatus('saved')
+      // Fade the "Saved" pill back to idle after a moment
+      setTimeout(() => setSaveStatus('idle'), 1500)
+    }, 3000)
+    return () => clearTimeout(timer.current)
+  }, [a])
 
   const addSup = () => upd('suppliers', [...a.suppliers, { name: '', sectorId: 1, sectorScore: SECTORS[0].score, auditedScore: 0, expense: 0, origin: 'Local' }])
   const updSup = (i, k, v) => { const ns = [...a.suppliers]; ns[i] = { ...ns[i], [k]: v }; if (k === 'sectorId') { const sec = SECTORS.find(x => x.id === v); if (sec) ns[i].sectorScore = sec.score }; upd('suppliers', ns) }
@@ -420,9 +694,20 @@ function Calculator({ assessment, onSave, company, onExport, mobile }) {
 
   return (
     <div className="fade-in">
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
-        <div><h1 style={{ fontSize: mobile ? 22 : 28, fontWeight: 800, letterSpacing: '-0.02em', color: T.text, marginBottom: 4 }}>LC Score Calculator</h1><p style={{ fontSize: 13, color: T.muted }}>LCGPA Template {TEMPLATE_VERSION} — Auto-saves</p></div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16, flexWrap: 'wrap', gap: 12 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <h1 style={{ fontSize: mobile ? 22 : 28, fontWeight: 800, letterSpacing: '-0.02em', color: T.text, marginBottom: 4 }}>LC Score Calculator</h1>
+          <p style={{ fontSize: 13, color: T.muted }}>LCGPA Template {TEMPLATE_VERSION} {saveStatus === 'saving' ? '• Saving…' : saveStatus === 'saved' ? '• Saved' : '• Auto-saves'}</p>
+        </div>
         <button onClick={() => onExport(a)} style={{ ...btnP, padding: '8px 16px', fontSize: 13 }}>↓ PDF</button>
+      </div>
+      {/* Sample case story banner — shown when a sample case is loaded.
+          Dismissible but not hidden by default since the whole point is
+          the user learns something about LC scoring from it. */}
+      {a.sampleCase && !a.storyDismissed && <SampleStoryBanner sample={a.sampleCase} score={score} mobile={mobile} onDismiss={() => upd('storyDismissed', true)} />}
+      {/* Assessment name — lets users tell multiple assessments apart on the dashboard */}
+      <div style={{ marginBottom: 16 }}>
+        <input value={a.name || ''} onChange={e => upd('name', e.target.value)} placeholder="Name this assessment (e.g., 'FY 2024 Baseline')" maxLength={80} style={{ ...inputStyle, fontSize: 15, fontWeight: 600, background: T.bgCard }} />
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: mobile ? 'repeat(2, 1fr)' : 'repeat(5, 1fr)', gap: 10, marginBottom: 16 }}>
         <SP label="Total LC" value={pct(score.totalScore)} highlight color={score.meetsThreshold ? T.success : T.danger} />
@@ -448,6 +733,64 @@ function Calculator({ assessment, onSave, company, onExport, mobile }) {
     </div>
   )
 }
+// ═══ SAMPLE STORY BANNER ═══
+// Educational explanation shown at the top of the Calculator when a
+// sample case is loaded. Explains what's driving the score and what
+// the company could do differently.
+function SampleStoryBanner({ sample, score, mobile, onDismiss }) {
+  const story = SAMPLE_STORIES[sample]
+  if (!story) return null
+  // Color accent per sample case
+  const accent = sample === 'low' ? T.danger : sample === 'mid' ? T.warning : T.success
+  const bg = sample === 'low' ? 'rgba(239,68,68,0.08)' : sample === 'mid' ? 'rgba(245,158,11,0.08)' : 'rgba(16,185,129,0.08)'
+
+  return (
+    <div className="fade-in" style={{ background: bg, border: `1px solid ${accent}44`, borderRadius: 14, padding: mobile ? 16 : 20, marginBottom: 16 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 12 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 11, fontWeight: 700, color: accent, textTransform: 'uppercase', letterSpacing: '0.05em', padding: '2px 8px', background: `${accent}22`, borderRadius: 4 }}>Sample case</span>
+            <span style={{ fontSize: 14, fontWeight: 700, color: T.text }}>Score: {pct(score.totalScore)}</span>
+          </div>
+          <h3 style={{ fontSize: mobile ? 16 : 17, fontWeight: 700, color: T.text, marginBottom: 4 }}>{story.headline}</h3>
+          <p style={{ fontSize: 13, color: T.muted, fontStyle: 'italic' }}>{story.verdict}</p>
+        </div>
+        <button onClick={onDismiss} style={{ background: 'transparent', border: `1px solid ${T.border}`, borderRadius: 6, color: T.muted, fontSize: 12, padding: '4px 10px', cursor: 'pointer', flexShrink: 0 }} title="Hide this explanation">Hide</button>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: mobile ? 12 : 20, marginTop: 12 }}>
+        {/* Left column: what drove the score */}
+        <div>
+          <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 10 }}>Why this score</div>
+          {story.drivers.map((d, i) => (
+            <div key={i} style={{ display: 'flex', gap: 10, marginBottom: 10, alignItems: 'flex-start' }}>
+              <div style={{ fontSize: 16, color: d.icon === '⬆' ? T.success : d.icon === '⬇' ? T.danger : T.muted, lineHeight: 1.4, flexShrink: 0 }}>{d.icon}</div>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: T.text, marginBottom: 2, lineHeight: 1.4 }}>{d.title}</div>
+                <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.5 }}>{d.detail}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Right column: what to do differently */}
+        <div>
+          <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 10 }}>Levers to pull</div>
+          {story.levers.map((lever, i) => (
+            <div key={i} style={{ display: 'flex', gap: 10, marginBottom: 10, alignItems: 'flex-start' }}>
+              <div style={{ fontSize: 13, color: accent, fontWeight: 800, flexShrink: 0, lineHeight: 1.5 }}>→</div>
+              <div style={{ fontSize: 13, color: T.text, lineHeight: 1.5 }}>{lever}</div>
+            </div>
+          ))}
+          <div style={{ fontSize: 11, color: T.dim, marginTop: 14, paddingTop: 12, borderTop: `1px solid ${T.border}`, lineHeight: 1.5 }}>
+            Click through the tabs below (Labor, G&S, Capacity, Depreciation) to see the exact numbers. Try changing values to see how the score responds.
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function SH({ title, desc }) { return <><h3 style={{ fontSize: 17, fontWeight: 700, color: T.text, marginBottom: 4 }}>{title}</h3><p style={{ fontSize: 13, color: T.muted, marginBottom: 20 }}>{desc}</p></> }
 function TB({ label, value }) { return <div style={{ marginTop: 16, padding: 14, background: T.bgInput, borderRadius: 8, display: 'flex', justifyContent: 'space-between' }}><span style={{ fontSize: 14, fontWeight: 600, color: T.text }}>{label}</span><span style={{ fontSize: 14, fontWeight: 700, color: T.accent }}>{value}</span></div> }
 function SP({ label, value, sub, highlight, color }) { return <div style={{ background: highlight ? (color === T.success ? 'rgba(16,185,129,0.1)' : 'rgba(239,68,68,0.1)') : T.bgCard, border: `1px solid ${highlight ? color : T.border}`, borderRadius: 10, padding: '12px 14px', textAlign: 'center' }}><div style={{ fontSize: 10, fontWeight: 600, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 3 }}>{label}</div><div style={{ fontSize: highlight ? 20 : 14, fontWeight: 800, color: highlight ? color : T.text }}>{value}</div>{sub && <div style={{ fontSize: 10, color: T.dim, marginTop: 2 }}>{sub}</div>}</div> }
