@@ -3,6 +3,7 @@ import { supabase, signUp, signIn, signOut, getSession, saveCompany, getCompany,
 import { SECTORS, PRODUCT_CATEGORIES, LC_THRESHOLD, ASSET_TYPES, TEMPLATE_VERSION } from './lib/sectors.js'
 import { computeScore, getRecommendations, fmt, pct, TOOLTIPS } from './lib/scoring.js'
 import { SAMPLE_CASES, SAMPLE_SECTORS, SAMPLE_STORIES } from './lib/samples.js'
+import { parseLCGPAExcel, parseSupplierCSV, downloadCSVTemplate } from './lib/importers.js'
 import { exportAssessmentPDF } from './lib/pdf.js'
 
 // ─── THEME ─────────────────────────────────────────────────────────────
@@ -105,6 +106,7 @@ export default function App() {
   const [company, setCompany] = useState(null)
   const [assessments, setAssessments] = useState([])
   const [curA, setCurA] = useState(null)
+  const [importResult, setImportResult] = useState(null)
   const [sbOpen, setSbOpen] = useState(window.innerWidth > 768)
   const [loading, setLoading] = useState(true)
   const [toast, setToast] = useState(null)
@@ -263,7 +265,8 @@ export default function App() {
       {(!mobile || sbOpen) && <><Sidebar view={view} setView={setView} user={user} open={mobile ? true : sbOpen} toggle={() => setSbOpen(!sbOpen)} onLogout={handleLogout} mobile={mobile} />{mobile && sbOpen && <div onClick={() => setSbOpen(false)} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 99 }} />}</>}
       <main style={{ flex: 1, marginLeft: sidebarWidth, transition: 'margin-left 0.3s ease', padding: mobile ? '60px 16px 16px' : '32px 40px' }}>
         {view === 'dashboard' && <Dashboard company={company} assessments={assessments} onNew={() => setView('new-assessment')} onSetup={() => setView('company-setup')} onView={a => { setCurA(a); setView('calculator') }} onDelete={handleDeleteAssessment} onAdvisor={() => setView('advisor')} onExport={handleExport} mobile={mobile} />}
-        {view === 'new-assessment' && <SamplePicker mobile={mobile} onBlank={() => { setCurA(emptyAssessment()); setView('calculator') }} onSample={(caseId, sectorId) => { const c = SAMPLE_CASES.find(x => x.id === caseId); if (!c) return; const a = { id: Date.now(), date: new Date().toISOString(), ...c.build(sectorId) }; setCurA(a); setView('calculator') }} onBack={() => setView('dashboard')} />}
+        {view === 'new-assessment' && <SamplePicker mobile={mobile} onBlank={() => { setCurA(emptyAssessment()); setView('calculator') }} onSample={(caseId, sectorId) => { const c = SAMPLE_CASES.find(x => x.id === caseId); if (!c) return; const a = { id: Date.now(), date: new Date().toISOString(), ...c.build(sectorId) }; setCurA(a); setView('calculator') }} onImport={(result) => { setCurA(result.assessment); setImportResult(result); setView('import-review') }} onBack={() => setView('dashboard')} />}
+        {view === 'import-review' && <ImportReview mobile={mobile} result={importResult} onAccept={() => { setView('calculator') }} onCancel={() => { setCurA(null); setImportResult(null); setView('new-assessment') }} />}
         {view === 'calculator' && <Calculator assessment={curA || emptyAssessment()} onSave={handleSaveAssessment} company={company} onExport={handleExport} mobile={mobile} />}
         {view === 'made-in-saudi' && <MadeInSaudi mobile={mobile} />}
         {view === 'advisor' && <Advisor company={company} currentAssessment={curA} mobile={mobile} />}
@@ -561,20 +564,144 @@ function QA({ icon, title, desc, onClick }) { return <div onClick={onClick} styl
 // Shown when the user clicks "+ New" on the dashboard. Lets them start
 // with a blank assessment, or load one of three pre-built sample cases
 // (low LC / at threshold / high LC) tailored to their industry.
-function SamplePicker({ mobile, onBlank, onSample, onBack }) {
+// ═══ IMPORT REVIEW ═══
+// Shown after a user uploads their LCGPA Excel. Displays the extracted
+// numbers so they can confirm them before the score is computed. This is
+// a trust-builder — imports aren't a black box.
+function ImportReview({ mobile, result, onAccept, onCancel }) {
+  if (!result) return null
+  const { assessment, summary, warnings } = result
+  const score = computeScore(assessment)
+
+  return (
+    <div className="fade-in">
+      <div style={{ marginBottom: 8 }}>
+        <button onClick={onCancel} style={{ background: 'none', border: 'none', color: T.muted, fontSize: 14, cursor: 'pointer', marginBottom: 16, padding: 0 }}>← Back to import options</button>
+        <h1 style={{ fontSize: mobile ? 22 : 28, fontWeight: 800, letterSpacing: '-0.02em', color: T.text, marginBottom: 4 }}>Review imported data</h1>
+        <p style={{ fontSize: 14, color: T.muted }}>From <b style={{ color: T.text }}>{assessment.importFileName || 'Excel file'}</b>. Confirm the extracted values before continuing — you can edit anything afterwards.</p>
+      </div>
+
+      {/* Warnings banner */}
+      {warnings && warnings.length > 0 && (
+        <div style={{ background: 'rgba(245,158,11,0.08)', border: `1px solid ${T.warning}55`, borderRadius: 10, padding: 14, marginTop: 16, marginBottom: 16 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: T.warning, marginBottom: 6 }}>Notes from the import</div>
+          {warnings.map((w, i) => <div key={i} style={{ fontSize: 12, color: T.text, lineHeight: 1.5, marginBottom: 2 }}>• {w}</div>)}
+        </div>
+      )}
+
+      {/* Preview score card */}
+      <div style={{ background: T.bgCard, border: `1px solid ${score.meetsThreshold ? T.success : T.danger}55`, borderRadius: 14, padding: mobile ? 16 : 20, marginTop: 20, marginBottom: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+        <div>
+          <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 4 }}>Computed LC score</div>
+          <div style={{ fontSize: 32, fontWeight: 800, color: score.meetsThreshold ? T.success : T.danger, letterSpacing: '-0.02em' }}>{pct(score.totalScore)}</div>
+          <div style={{ fontSize: 12, color: T.muted, marginTop: 2 }}>{score.meetsThreshold ? `Above ${pct(LC_THRESHOLD)} threshold` : `${pct(score.gap)} below ${pct(LC_THRESHOLD)} threshold`}</div>
+        </div>
+        <div style={{ fontSize: 12, color: T.muted, textAlign: mobile ? 'left' : 'right' }}>
+          <div>Total LC: SAR {fmt(score.totalLC)}</div>
+          <div>Total Cost: SAR {fmt(score.totalCost)}</div>
+        </div>
+      </div>
+
+      {/* Extracted data summary */}
+      <div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 12, marginBottom: 20 }}>
+        <div style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 10, padding: 14 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 8 }}>Labor (Section 3)</div>
+          <div style={{ fontSize: 13, color: T.text, marginBottom: 4 }}>Saudi: <b>SAR {fmt(summary.laborSaudi)}</b></div>
+          <div style={{ fontSize: 13, color: T.text }}>Foreign: <b>SAR {fmt(summary.laborForeign)}</b></div>
+        </div>
+        <div style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 10, padding: 14 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 8 }}>Goods & Services (Section 4)</div>
+          <div style={{ fontSize: 13, color: T.text, marginBottom: 4 }}>Total G&S: <b>SAR {fmt(summary.totalGSExpense)}</b></div>
+          <div style={{ fontSize: 13, color: T.text }}>Suppliers listed: <b>{summary.supplierCount}</b></div>
+        </div>
+        <div style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 10, padding: 14 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 8 }}>Capacity Building (Section 6)</div>
+          <div style={{ fontSize: 13, color: T.text, marginBottom: 4 }}>Training: <b>SAR {fmt(summary.training)}</b></div>
+          <div style={{ fontSize: 13, color: T.text, marginBottom: 4 }}>Supplier dev: <b>SAR {fmt(summary.supplierDev)}</b></div>
+          <div style={{ fontSize: 13, color: T.text }}>R&D: <b>SAR {fmt(summary.rdExpense)}</b></div>
+        </div>
+        <div style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 10, padding: 14 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 8 }}>Depreciation (Section 7)</div>
+          <div style={{ fontSize: 13, color: T.text }}>Asset lines imported: <b>{summary.assetCount}</b></div>
+        </div>
+      </div>
+
+      {/* Supplier list preview (first 8) */}
+      {assessment.suppliers && assessment.suppliers.length > 0 && (
+        <div style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 10, padding: 14, marginBottom: 20 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: T.text, marginBottom: 10 }}>First {Math.min(8, assessment.suppliers.length)} suppliers</div>
+          {assessment.suppliers.slice(0, 8).map((s, i) => {
+            const sec = SECTORS.find(x => x.id === s.sectorId)
+            return (
+              <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0', borderBottom: i < 7 && i < assessment.suppliers.length - 1 ? `1px solid ${T.border}` : 'none', fontSize: 12, gap: 12 }}>
+                <div style={{ color: T.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.name}</div>
+                <div style={{ color: T.muted, flexShrink: 0 }}>{sec ? sec.name : `sector ${s.sectorId}`} · SAR {fmt(s.expense)}</div>
+              </div>
+            )
+          })}
+          {assessment.suppliers.length > 8 && <div style={{ fontSize: 11, color: T.dim, marginTop: 8 }}>…and {assessment.suppliers.length - 8} more.</div>}
+        </div>
+      )}
+
+      {/* Action buttons */}
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+        <button onClick={onAccept} style={{ ...btnP, flex: 1, minWidth: 180 }}>Open in Calculator →</button>
+        <button onClick={onCancel} style={{ padding: '12px 24px', background: 'transparent', border: `1px solid ${T.border}`, borderRadius: 8, color: T.muted, fontSize: 14, cursor: 'pointer' }}>Cancel</button>
+      </div>
+    </div>
+  )
+}
+
+function SamplePicker({ mobile, onBlank, onSample, onImport, onBack }) {
   const [selectedSector, setSelectedSector] = useState('generic')
+  const [importing, setImporting] = useState(false)
+  const [importError, setImportError] = useState('')
+  const fileRef = useRef(null)
   const color = { danger: T.danger, warning: T.warning, success: T.success }
+
+  const handleFileSelected = async (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    // Reset the input so picking the same file again triggers onChange
+    e.target.value = ''
+    setImporting(true); setImportError('')
+    try {
+      const result = await parseLCGPAExcel(file)
+      onImport(result)
+    } catch (err) {
+      setImportError(err?.message || 'Could not read this file.')
+    } finally {
+      setImporting(false)
+    }
+  }
 
   return (
     <div className="fade-in">
       <div style={{ marginBottom: 8 }}>
         <button onClick={onBack} style={{ background: 'none', border: 'none', color: T.muted, fontSize: 14, cursor: 'pointer', marginBottom: 16, padding: 0 }}>← Back to dashboard</button>
         <h1 style={{ fontSize: mobile ? 22 : 28, fontWeight: 800, letterSpacing: '-0.02em', color: T.text, marginBottom: 4 }}>Start a new assessment</h1>
-        <p style={{ fontSize: 14, color: T.muted }}>Begin with your own data, or try a sample case to see how LC scoring works.</p>
+        <p style={{ fontSize: 14, color: T.muted }}>Import your data, start blank, or try a sample case to see how LC scoring works.</p>
       </div>
 
-      {/* Option A: blank assessment */}
-      <div onClick={onBlank} style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 14, padding: mobile ? 16 : 20, marginTop: 20, marginBottom: 16, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, transition: 'border-color 0.2s' }}
+      {importError && <div style={{ padding: '12px 14px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 10, color: T.danger, fontSize: 13, marginTop: 16, lineHeight: 1.5 }}>{importError}</div>}
+
+      {/* Option A: import from official LCGPA Excel */}
+      <input ref={fileRef} type="file" accept=".xlsx,.xls" onChange={handleFileSelected} style={{ display: 'none' }} />
+      <div onClick={() => !importing && fileRef.current?.click()} style={{ border: `1px solid rgba(16,185,129,0.3)`, borderRadius: 14, padding: mobile ? 16 : 20, marginTop: 20, marginBottom: 12, cursor: importing ? 'wait' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, transition: 'border-color 0.2s, background 0.2s', background: importing ? T.bgCard : T.glow }}
+        onMouseEnter={e => { if (!importing) e.currentTarget.style.borderColor = T.accent }}
+        onMouseLeave={e => { if (!importing) e.currentTarget.style.borderColor = 'rgba(16,185,129,0.3)' }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 11, fontWeight: 700, color: T.accent, textTransform: 'uppercase', letterSpacing: '0.05em', padding: '2px 8px', background: `${T.accent}22`, borderRadius: 4 }}>Fastest</span>
+            <div style={{ fontSize: 15, fontWeight: 700, color: T.text }}>Import from LCGPA Excel</div>
+          </div>
+          <div style={{ fontSize: 13, color: T.muted, lineHeight: 1.5 }}>{importing ? 'Reading your file…' : 'Upload the official LCGPA V2 template (OM-LRG-02) filled in with your data. We\'ll extract labor, suppliers, capacity, and depreciation automatically.'}</div>
+        </div>
+        <div style={{ color: T.accent, fontSize: 20, flexShrink: 0 }}>{importing ? '…' : '↑'}</div>
+      </div>
+
+      {/* Option B: blank assessment */}
+      <div onClick={onBlank} style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 14, padding: mobile ? 16 : 20, marginBottom: 16, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, transition: 'border-color 0.2s' }}
         onMouseEnter={e => e.currentTarget.style.borderColor = T.accentDim}
         onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
         <div>
@@ -584,7 +711,7 @@ function SamplePicker({ mobile, onBlank, onSample, onBack }) {
         <div style={{ color: T.muted, fontSize: 20 }}>→</div>
       </div>
 
-      {/* Option B: load a sample case */}
+      {/* Option C: load a sample case */}
       <div style={{ marginTop: 24, marginBottom: 12 }}>
         <h2 style={{ fontSize: 16, fontWeight: 700, color: T.text, marginBottom: 4 }}>Or try a sample case</h2>
         <p style={{ fontSize: 13, color: T.muted }}>See how different companies score and why. Each sample comes with an explanation of what drives its score.</p>
@@ -690,6 +817,31 @@ function Calculator({ assessment, onSave, company, onExport, mobile }) {
   const updAsset = (i, k, v) => { const na = [...a.assets]; na[i] = { ...na[i], [k]: v }; upd('assets', na) }
   const rmAsset = i => upd('assets', a.assets.filter((_, j) => j !== i))
 
+  // CSV supplier import
+  const csvInputRef = useRef(null)
+  const [csvMessage, setCsvMessage] = useState(null) // { type: 'success'|'warning'|'error', text, warnings? }
+  const handleCSVSelected = async (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    e.target.value = ''
+    try {
+      const text = await file.text()
+      const { suppliers: newSups, warnings } = parseSupplierCSV(text)
+      // Append to existing rows — users can remove duplicates manually.
+      // Appending is safer than replacing; keeps existing data intact.
+      upd('suppliers', [...a.suppliers, ...newSups])
+      setCsvMessage({
+        type: warnings.length > 0 ? 'warning' : 'success',
+        text: `Imported ${newSups.length} supplier${newSups.length === 1 ? '' : 's'}${warnings.length > 0 ? ` (${warnings.length} row${warnings.length === 1 ? '' : 's'} skipped — see below)` : ''}.`,
+        warnings,
+      })
+      // Auto-dismiss success after 5s; keep warnings visible until dismissed
+      if (warnings.length === 0) setTimeout(() => setCsvMessage(null), 5000)
+    } catch (err) {
+      setCsvMessage({ type: 'error', text: err?.message || 'Could not read this CSV file.' })
+    }
+  }
+
   const tabs = [{ id: 'labor', label: mobile ? 'Labor' : 'Labor', icon: '👥' }, { id: 'goods', label: mobile ? 'G&S' : 'Goods & Services', icon: '📦' }, { id: 'capacity', label: mobile ? 'Capacity' : 'Capacity Building', icon: '🎓' }, { id: 'depreciation', label: mobile ? 'Depr.' : 'Depreciation', icon: '🏗' }, { id: 'summary', label: 'Summary', icon: '📋' }]
 
   return (
@@ -725,7 +877,7 @@ function Calculator({ assessment, onSave, company, onExport, mobile }) {
       </div>
       <div style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderRadius: 16, padding: mobile ? 16 : 28 }}>
         {tab === 'labor' && <><SH title="Section 3: Labor" desc="Saudi at 100%, foreign at 53.4%." /><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 16 }}><div><label style={labelStyle}>Saudi Compensation (SAR)<Tip tipKey="saudiComp" /></label><input type="number" value={a.labor.saudiComp || ''} onChange={e => upd('labor.saudiComp', Number(e.target.value))} placeholder="0" style={inputStyle} /><div style={{ fontSize: 12, color: T.accent, marginTop: 4 }}>100% → SAR {fmt(a.labor.saudiComp || 0)}</div></div><div><label style={labelStyle}>Foreign Compensation (SAR)<Tip tipKey="foreignComp" /></label><input type="number" value={a.labor.foreignComp || ''} onChange={e => upd('labor.foreignComp', Number(e.target.value))} placeholder="0" style={inputStyle} /><div style={{ fontSize: 12, color: T.dim, marginTop: 4 }}>53.4% → SAR {fmt((a.labor.foreignComp || 0) * 0.534)}</div></div></div><TB label="Total Labor LC" value={`SAR ${fmt(score.laborLC)}`} /></>}
-        {tab === 'goods' && <><SH title="Section 4: Goods & Services" desc="Enter total G&S expense, then list top suppliers (≥70% of spend or top 40)." /><div style={{ marginBottom: 16 }}><label style={labelStyle}>Total G&S Expense (SAR)<Tip tipKey="totalGSExpense" /></label><input type="number" value={a.totalGSExpense || ''} onChange={e => upd('totalGSExpense', Number(e.target.value))} placeholder="0" style={inputStyle} />{score.declaredTotalGS > 0 && score.listedSupplierExpense > 0 && <div style={{ fontSize: 12, color: (score.listedSupplierExpense / score.declaredTotalGS) >= 0.7 ? T.accent : T.warning, marginTop: 4 }}>Supplier coverage: {pct(score.listedSupplierExpense / score.declaredTotalGS)}{score.remainingGS > 0 && ` • Remaining SAR ${fmt(score.remainingGS)} scored at weighted avg ${pct(score.weightedAvgLC)}`}</div>}</div>{a.suppliers.map((sup, i) => <div key={i} style={{ padding: mobile ? 12 : 16, border: `1px solid ${T.border}`, borderRadius: 10, marginBottom: 12, position: 'relative' }}><button onClick={() => rmSup(i)} style={{ position: 'absolute', top: 8, right: 8, background: 'none', border: 'none', color: T.danger, cursor: 'pointer', fontSize: 16, padding: 4 }}>✕</button><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '2fr 1fr 2fr 1fr', gap: 12, alignItems: 'end' }}><div><label style={labelStyle}>Supplier<Tip tipKey="supplierName" /></label><input value={sup.name} onChange={e => updSup(i, 'name', e.target.value)} placeholder="Name" style={inputStyle} /></div><div><label style={labelStyle}>Origin</label><select value={sup.origin} onChange={e => updSup(i, 'origin', e.target.value)} style={{ ...inputStyle, cursor: 'pointer' }}><option value="Local">Local</option><option value="Foreign">Foreign</option></select></div><div><label style={labelStyle}>Sector<Tip tipKey="supplierSector" /></label><select value={sup.sectorId} onChange={e => updSup(i, 'sectorId', Number(e.target.value))} style={{ ...inputStyle, cursor: 'pointer', fontSize: 12 }}>{SECTORS.map(sec => <option key={sec.id} value={sec.id}>{sec.name} ({pct(sec.score)})</option>)}</select></div><div><label style={labelStyle}>Expense (SAR)<Tip tipKey="supplierExpense" /></label><input type="number" value={sup.expense || ''} onChange={e => updSup(i, 'expense', Number(e.target.value))} placeholder="0" style={inputStyle} /></div></div><div style={{ fontSize: 12, color: T.accent, marginTop: 8 }}>LC: SAR {fmt((sup.expense || 0) * (sup.auditedScore > 0 ? sup.auditedScore : (sup.sectorScore || 0)))}</div></div>)}<button onClick={addSup} style={{ padding: '10px 20px', background: 'transparent', border: `1px dashed ${T.border}`, borderRadius: 8, color: T.muted, fontSize: 13, cursor: 'pointer', width: '100%' }}>+ Add Supplier</button><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 16, marginTop: 16 }}><div><label style={labelStyle}>Other Costs (SAR)<Tip tipKey="otherCosts" /></label><input type="number" value={a.otherCosts || ''} onChange={e => upd('otherCosts', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>Inventory Movement<Tip tipKey="inventoryMovement" /></label><input type="number" value={a.inventoryMovement || ''} onChange={e => upd('inventoryMovement', Number(e.target.value))} placeholder="0" style={inputStyle} /></div></div><TB label="Total G&S LC" value={`SAR ${fmt(score.gsLC)}`} /></>}
+        {tab === 'goods' && <><SH title="Section 4: Goods & Services" desc="Enter total G&S expense, then list top suppliers (≥70% of spend or top 40)." /><div style={{ marginBottom: 16 }}><label style={labelStyle}>Total G&S Expense (SAR)<Tip tipKey="totalGSExpense" /></label><input type="number" value={a.totalGSExpense || ''} onChange={e => upd('totalGSExpense', Number(e.target.value))} placeholder="0" style={inputStyle} />{score.declaredTotalGS > 0 && score.listedSupplierExpense > 0 && <div style={{ fontSize: 12, color: (score.listedSupplierExpense / score.declaredTotalGS) >= 0.7 ? T.accent : T.warning, marginTop: 4 }}>Supplier coverage: {pct(score.listedSupplierExpense / score.declaredTotalGS)}{score.remainingGS > 0 && ` • Remaining SAR ${fmt(score.remainingGS)} scored at weighted avg ${pct(score.weightedAvgLC)}`}</div>}</div>{a.suppliers.map((sup, i) => <div key={i} style={{ padding: mobile ? 12 : 16, border: `1px solid ${T.border}`, borderRadius: 10, marginBottom: 12, position: 'relative' }}><button onClick={() => rmSup(i)} style={{ position: 'absolute', top: 8, right: 8, background: 'none', border: 'none', color: T.danger, cursor: 'pointer', fontSize: 16, padding: 4 }}>✕</button><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '2fr 1fr 2fr 1fr', gap: 12, alignItems: 'end' }}><div><label style={labelStyle}>Supplier<Tip tipKey="supplierName" /></label><input value={sup.name} onChange={e => updSup(i, 'name', e.target.value)} placeholder="Name" style={inputStyle} /></div><div><label style={labelStyle}>Origin</label><select value={sup.origin} onChange={e => updSup(i, 'origin', e.target.value)} style={{ ...inputStyle, cursor: 'pointer' }}><option value="Local">Local</option><option value="Foreign">Foreign</option></select></div><div><label style={labelStyle}>Sector<Tip tipKey="supplierSector" /></label><select value={sup.sectorId} onChange={e => updSup(i, 'sectorId', Number(e.target.value))} style={{ ...inputStyle, cursor: 'pointer', fontSize: 12 }}>{SECTORS.map(sec => <option key={sec.id} value={sec.id}>{sec.name} ({pct(sec.score)})</option>)}</select></div><div><label style={labelStyle}>Expense (SAR)<Tip tipKey="supplierExpense" /></label><input type="number" value={sup.expense || ''} onChange={e => updSup(i, 'expense', Number(e.target.value))} placeholder="0" style={inputStyle} /></div></div><div style={{ fontSize: 12, color: T.accent, marginTop: 8 }}>LC: SAR {fmt((sup.expense || 0) * (sup.auditedScore > 0 ? sup.auditedScore : (sup.sectorScore || 0)))}</div></div>)}<div style={{ display: 'flex', gap: 8 }}><button onClick={addSup} style={{ padding: '10px 20px', background: 'transparent', border: `1px dashed ${T.border}`, borderRadius: 8, color: T.muted, fontSize: 13, cursor: 'pointer', flex: 1 }}>+ Add Supplier</button><button onClick={() => csvInputRef.current?.click()} style={{ padding: '10px 20px', background: 'transparent', border: `1px dashed ${T.accentDim}`, borderRadius: 8, color: T.accent, fontSize: 13, cursor: 'pointer', flex: 1 }}>↑ Import CSV</button><input ref={csvInputRef} type="file" accept=".csv,.txt" onChange={handleCSVSelected} style={{ display: 'none' }} /></div><div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 6, marginBottom: csvMessage ? 8 : 0 }}><span onClick={downloadCSVTemplate} style={{ fontSize: 11, color: T.muted, cursor: 'pointer', textDecoration: 'underline' }}>Download CSV template</span></div>{csvMessage && <div style={{ padding: '10px 14px', background: csvMessage.type === 'error' ? 'rgba(239,68,68,0.1)' : csvMessage.type === 'warning' ? 'rgba(245,158,11,0.1)' : T.glow, border: `1px solid ${csvMessage.type === 'error' ? 'rgba(239,68,68,0.3)' : csvMessage.type === 'warning' ? 'rgba(245,158,11,0.3)' : 'rgba(16,185,129,0.3)'}`, borderRadius: 8, color: csvMessage.type === 'error' ? T.danger : csvMessage.type === 'warning' ? T.warning : T.accent, fontSize: 13, marginBottom: 8, lineHeight: 1.5 }}><div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 }}><div style={{ flex: 1 }}><div style={{ fontWeight: 600, marginBottom: csvMessage.warnings && csvMessage.warnings.length > 0 ? 6 : 0 }}>{csvMessage.text}</div>{csvMessage.warnings && csvMessage.warnings.length > 0 && <div style={{ fontSize: 12, color: T.text, lineHeight: 1.6 }}>{csvMessage.warnings.map((w, i) => <div key={i}>• {w}</div>)}</div>}</div><button onClick={() => setCsvMessage(null)} style={{ background: 'transparent', border: 'none', color: 'inherit', cursor: 'pointer', fontSize: 16, padding: 0, lineHeight: 1 }}>✕</button></div></div>}<div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 16, marginTop: 16 }}><div><label style={labelStyle}>Other Costs (SAR)<Tip tipKey="otherCosts" /></label><input type="number" value={a.otherCosts || ''} onChange={e => upd('otherCosts', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>Inventory Movement<Tip tipKey="inventoryMovement" /></label><input type="number" value={a.inventoryMovement || ''} onChange={e => upd('inventoryMovement', Number(e.target.value))} placeholder="0" style={inputStyle} /></div></div><TB label="Total G&S LC" value={`SAR ${fmt(score.gsLC)}`} /></>}
         {tab === 'capacity' && <><SH title="Section 6: Capacity Building" desc="Training, supplier dev, R&D — all at 100% LC. R&D also earns up to 10% bonus." /><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 16 }}><div><label style={labelStyle}>Saudi Training (SAR)<Tip tipKey="training" /></label><input type="number" value={a.training || ''} onChange={e => upd('training', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>Supplier Development (SAR)<Tip tipKey="supplierDev" /></label><input type="number" value={a.supplierDev || ''} onChange={e => upd('supplierDev', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>R&D in KSA (SAR)<Tip tipKey="rdExpense" /></label><input type="number" value={a.rdExpense || ''} onChange={e => upd('rdExpense', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>Total Revenue (SAR)<Tip tipKey="totalRevenue" /></label><input type="number" value={a.totalRevenue || ''} onChange={e => upd('totalRevenue', Number(e.target.value))} placeholder="0" style={inputStyle} /><div style={{ fontSize: 12, color: score.rdIncentive > 0 ? T.accent : T.dim, marginTop: 4 }}>R&D Incentive: {pct(score.rdIncentive)} (added to final score)</div></div></div><TB label="Total Capacity LC" value={`SAR ${fmt(score.capacityLC)}`} /></>}
         {tab === 'depreciation' && <><SH title="Section 7: Depreciation & Amortization" desc="KSA-produced 100%, foreign 30%. Buildings & Land Improvements in KSA always 100%." />{a.assets.map((ast, i) => { const typeDef = ASSET_TYPES.find(t => t.id === ast.assetType); const isBuilding = !!(typeDef && typeDef.alwaysLocal); const factor = isBuilding ? 1 : (ast.producedInKSA ? 1 : 0.3); return (<div key={i} style={{ padding: mobile ? 12 : 16, border: `1px solid ${T.border}`, borderRadius: 10, marginBottom: 12, position: 'relative' }}><button onClick={() => rmAsset(i)} style={{ position: 'absolute', top: 8, right: 8, background: 'none', border: 'none', color: T.danger, cursor: 'pointer', fontSize: 16, padding: 4 }}>✕</button><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '2fr 2fr 1fr 1fr', gap: 12, alignItems: 'end' }}><div><label style={labelStyle}>Description<Tip tipKey="assetName" /></label><input value={ast.name} onChange={e => updAsset(i, 'name', e.target.value)} placeholder="e.g., Headquarters building" style={inputStyle} /></div><div><label style={labelStyle}>Asset Class<Tip tipKey="assetType" /></label><select value={ast.assetType || 'MACHINERY'} onChange={e => updAsset(i, 'assetType', e.target.value)} style={{ ...inputStyle, cursor: 'pointer', fontSize: 12 }}>{ASSET_TYPES.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}</select></div><div><label style={labelStyle}>Amount (SAR)<Tip tipKey="assetAmount" /></label><input type="number" value={ast.amount || ''} onChange={e => updAsset(i, 'amount', Number(e.target.value))} placeholder="0" style={inputStyle} /></div><div><label style={labelStyle}>Made in KSA?<Tip tipKey="assetKSA" /></label><select value={isBuilding ? 'yes' : (ast.producedInKSA ? 'yes' : 'no')} onChange={e => updAsset(i, 'producedInKSA', e.target.value === 'yes')} disabled={isBuilding} style={{ ...inputStyle, cursor: isBuilding ? 'not-allowed' : 'pointer', opacity: isBuilding ? 0.6 : 1 }}><option value="yes">Yes (100%)</option><option value="no">No (30%)</option></select></div></div><div style={{ fontSize: 12, color: T.accent, marginTop: 8 }}>LC: SAR {fmt((ast.amount || 0) * factor)}{isBuilding && ' • Building in KSA: always 100%'}</div></div>)})}<button onClick={addAsset} style={{ padding: '10px 20px', background: 'transparent', border: `1px dashed ${T.border}`, borderRadius: 8, color: T.muted, fontSize: 13, cursor: 'pointer', width: '100%' }}>+ Add Asset</button><TB label="Total Depreciation LC" value={`SAR ${fmt(score.depLC)}`} /></>}
         {tab === 'summary' && <><SH title="Summary & Recommendations" desc="Full breakdown." /><div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 12, marginBottom: 20 }}>{[{ l: 'Labor', v: score.laborLC, t: score.laborTotal }, { l: 'G&S', v: score.gsLC, t: score.gsTotal }, { l: 'Capacity', v: score.capacityLC, t: 0 }, { l: 'Depreciation', v: score.depLC, t: score.depTotal }].map((x, i) => <div key={i} style={{ padding: 14, background: T.bgInput, borderRadius: 10, border: `1px solid ${T.border}` }}><div style={{ fontSize: 12, color: T.muted, fontWeight: 600, marginBottom: 4 }}>{x.l}</div><div style={{ fontSize: 18, fontWeight: 800, color: T.accent }}>SAR {fmt(x.v)}</div>{x.t > 0 && <div style={{ fontSize: 11, color: T.dim }}>of SAR {fmt(x.t)}</div>}</div>)}</div><h4 style={{ fontSize: 15, fontWeight: 700, color: T.text, marginBottom: 12 }}>Recommendations</h4>{recs.map((r, i) => { const c = { critical: T.danger, warning: T.warning, info: '#3b82f6', success: T.success }; return <div key={i} style={{ padding: '12px 14px', borderRadius: 10, marginBottom: 8, border: `1px solid ${c[r.type]}33`, background: `${c[r.type]}0a` }}><div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}><div style={{ fontSize: 13, fontWeight: 700, color: c[r.type] }}>{r.title}</div>{r.ref && <div style={{ fontSize: 10, color: T.dim, fontStyle: 'italic' }}>{r.ref}</div>}</div><div style={{ fontSize: 13, color: T.text, lineHeight: 1.6 }}>{r.text}</div></div> })}</>}
